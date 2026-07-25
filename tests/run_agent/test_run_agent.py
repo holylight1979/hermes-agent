@@ -128,6 +128,85 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
     assert messages == [{"role": "user", "content": "hello"}]
 
 
+def test_router_enabled_init_preserves_full_catalog_and_fixed_surface():
+    from agent.tool_router import ToolRouterConfig
+    from tools.tool_search import ToolSearchConfig
+
+    raw = _make_tool_defs("clarify", "skill_view", "read_file", "terminal")
+    fixed = _make_tool_defs(
+        "clarify", "skill_view", "tool_search", "tool_describe", "tool_call"
+    )
+
+    def definitions(**kwargs):
+        return raw if kwargs.get("skip_tool_search_assembly") else fixed
+
+    with (
+        patch("run_agent.get_tool_definitions", side_effect=definitions) as mocked_defs,
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch(
+            "agent.tool_router.load_config",
+            return_value=ToolRouterConfig.from_raw({"enabled": True}),
+        ),
+        patch(
+            "tools.tool_search.load_config",
+            return_value=ToolSearchConfig.from_raw({
+                "enabled": "on", "defer_core": True
+            }),
+        ),
+    ):
+        routed_agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert routed_agent._tool_router_catalog_defs == raw
+    assert routed_agent.tools == fixed
+    assert routed_agent.valid_tool_names == {
+        "clarify", "skill_view", "tool_search", "tool_describe", "tool_call"
+    }
+    assert mocked_defs.call_count == 2
+    assert mocked_defs.call_args_list[0].kwargs["skip_tool_search_assembly"] is True
+    assert "skip_tool_search_assembly" not in mocked_defs.call_args_list[1].kwargs
+
+
+def test_router_enabled_without_core_deferral_is_disabled_for_session():
+    from agent.tool_router import ToolRouterConfig
+    from tools.tool_search import ToolSearchConfig
+
+    raw = _make_tool_defs("clarify", "skill_view", "read_file", "terminal")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=raw) as mocked_defs,
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch(
+            "agent.tool_router.load_config",
+            return_value=ToolRouterConfig.from_raw({"enabled": True}),
+        ),
+        patch(
+            "tools.tool_search.load_config",
+            return_value=ToolSearchConfig.from_raw({
+                "enabled": "on", "defer_core": False
+            }),
+        ),
+    ):
+        routed_agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert routed_agent._tool_router_config.enabled is False
+    assert routed_agent._tool_router_catalog_defs == []
+    assert routed_agent.tools == raw
+    assert mocked_defs.call_count == 1
+
+
 def test_persist_user_message_override_preserves_multimodal_turns(agent):
     multimodal_content = [
         {"type": "text", "text": "What color is this?"},
@@ -3083,6 +3162,7 @@ class TestConcurrentToolExecution:
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                tool_search_config=agent._tool_search_config,
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
@@ -4203,6 +4283,59 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
+        assert result["completed"] is True
+
+    def test_tool_router_runs_once_and_uses_api_sidecar(self, agent):
+        from agent.tool_router import RouteDecision, ToolRouterConfig
+
+        self._setup_agent(agent)
+        agent._tool_router_config = ToolRouterConfig.from_raw({"enabled": True})
+        agent._tool_router_catalog_defs = _make_tool_defs(
+            "read_file", "terminal", "write_file"
+        )
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        decision = RouteDecision(
+            source="rule",
+            capabilities=("files_read",),
+            candidates=tuple(_make_tool_defs("read_file")),
+            confidence=1.0,
+            latency_ms=0.1,
+        )
+        with (
+            patch("agent.tool_router.route_turn", return_value=decision) as mocked_route,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("讀取 C:/repo/app.py")
+
+        mocked_route.assert_called_once()
+        request_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        api_user = next(m for m in reversed(request_messages) if m.get("role") == "user")
+        assert "[HERMES_TOOL_ROUTE]" in api_user["content"]
+        stored_user = next(m for m in reversed(result["messages"]) if m.get("role") == "user")
+        assert stored_user["content"] == "讀取 C:/repo/app.py"
+        assert "[HERMES_TOOL_ROUTE]" in stored_user["api_content"]
+
+    def test_tool_router_exception_does_not_block_main_model(self, agent):
+        from agent.tool_router import ToolRouterConfig
+
+        self._setup_agent(agent)
+        agent._tool_router_config = ToolRouterConfig.from_raw({"enabled": True})
+        agent._tool_router_catalog_defs = _make_tool_defs("read_file")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Recovered", finish_reason="stop"
+        )
+        with (
+            patch("agent.tool_router.route_turn", side_effect=RuntimeError("router broke")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("讀取 C:/repo/app.py")
+
+        assert result["final_response"] == "Recovered"
         assert result["completed"] is True
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):

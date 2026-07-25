@@ -15,13 +15,12 @@ problem. When activated, MCP and plugin tools are replaced in the
 model-visible tools array by three bridge tools, and the model loads each
 specific tool's schema on demand.
 
-:::info Built-in Hermes tools never defer
-The tools that make up Hermes' core capability set (`terminal`,
-`read_file`, `write_file`, `patch`, `search_files`, `todo`, `memory`,
-`browser_*`, `web_search`, `web_extract`, `clarify`, `execute_code`,
-`delegate_task`, `session_search`, and the rest of
-`_HERMES_CORE_TOOLS`) are *always* loaded directly. Only MCP tools and
-non-core plugin tools are eligible for deferral.
+:::info Core deferral is explicit opt-in
+Hermes core tools remain directly visible by default. Setting
+`defer_core: true` moves registered core tools behind the bridge except for
+`always_visible` (default: `clarify` and `skill_view`). The bridge tools are
+always direct, and unknown/unregistered names remain visible as a fail-safe.
+Use core deferral together with the hybrid pre-router described below.
 :::
 
 ## How it works
@@ -60,14 +59,15 @@ deferrable tool schemas would consume at least 10% of the active model's
 context window. Below that, the tools-array assembly is a pure
 pass-through and you pay no overhead.
 
-This decision is re-evaluated every time the tools array is built, so:
+This decision is evaluated when the session tools array is built, so:
 
 - A session with just a few MCP tools and a long context model never
   activates Tool Search.
 - A session with many MCP servers attached (15+ tools typically) starts
   activating it.
-- Removing MCP servers mid-session correctly returns to direct exposure
-  on the next assembly.
+- Configuration changes take effect in a new session. The session freezes its
+  bridge policy so a mid-session config edit cannot make an already-deferred
+  tool silently unreachable.
 
 ## Configuration
 
@@ -76,6 +76,8 @@ tools:
   tool_search:
     enabled: auto       # auto (default), on, or off
     threshold_pct: 10   # percentage of context — only used in auto mode
+    defer_core: false   # opt in to a fixed small main-model tool surface
+    always_visible: [clarify, skill_view]
     search_default_limit: 5
     max_search_limit: 20
 ```
@@ -84,6 +86,8 @@ tools:
 | --- | --- | --- |
 | `enabled` | `auto` | `auto` activates above threshold; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
 | `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
+| `defer_core` | `false` | When true, registered core tools may be deferred; unknown names still stay visible. |
+| `always_visible` | `[clarify, skill_view]` | Direct tools retained when core deferral is enabled. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 
@@ -93,6 +97,58 @@ You can also flip the legacy boolean shape:
 tools:
   tool_search: true   # equivalent to {enabled: auto}
 ```
+
+## Hybrid pre-router
+
+For a stable small main-model surface, enable core deferral and the optional
+hybrid pre-router together:
+
+```yaml
+tools:
+  tool_search:
+    enabled: on
+    defer_core: true
+    always_visible: [clarify, skill_view]
+  tool_router:
+    enabled: true
+    mode: hybrid
+    provider: rdchat-direct
+    model: gemma4:e4b-64k
+    timeout_seconds: 4
+    confidence_threshold: 0.75
+    max_candidates: 6
+    max_packet_tokens: 1800
+    include_compact_schemas: true
+    fail_open: true
+    telemetry: true
+```
+
+The model-facing `tools` array is then fixed to `clarify`, `skill_view`, and
+the three bridge tools. Once per user turn, high-confidence local rules—or,
+for ambiguous text, the configured low-cost classifier—append a bounded
+capability/candidate packet to the API-only user-message sidecar. The packet
+is a recommendation, not an authority decision:
+
+- candidates come only from that session's already-authorized catalog;
+- `tool_search` can still search the complete authorized catalog if the route
+  is wrong or incomplete;
+- classifier timeout, malformed output, low confidence, provider outage, and
+  internal router exceptions all fail open;
+- the underlying real tool name still passes through existing tool hooks,
+  guardrails, approval prompts, and command safety checks;
+- telemetry logs source, capability names, counts, estimated schema tokens,
+  and latency only—never user text, tool arguments, or secrets.
+
+:::warning Classifier data egress
+For ambiguous text, the classifier receives the complete raw user message.
+Use only a provider you trust with that content (for example, a local/private
+`rdchat-direct` endpoint). Telemetry omits the message, but that does not remove
+the classifier network request itself.
+:::
+
+The router runs once per user turn in the shared `AIAgent` prologue, so CLI and
+gateway sessions use the same implementation. It is skipped for multimodal
+turns; those retain full bridge-catalog recovery.
 
 ## When NOT to use it
 

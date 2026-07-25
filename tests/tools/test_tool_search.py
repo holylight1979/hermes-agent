@@ -82,6 +82,26 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_defer_core_defaults_off_for_backwards_compatibility(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw(None)
+        assert cfg.defer_core is False
+        assert cfg.always_visible == frozenset({"clarify", "skill_view"})
+
+    def test_defer_core_and_always_visible_are_safely_parsed(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "defer_core": "yes",
+            "always_visible": ["clarify", "skill_view", "read_file", "", 42],
+        })
+        assert cfg.defer_core is True
+        assert cfg.always_visible == frozenset({"clarify", "skill_view", "read_file"})
+
+    def test_invalid_always_visible_uses_safe_defaults(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({"always_visible": "terminal"})
+        assert cfg.always_visible == frozenset({"clarify", "skill_view"})
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -112,6 +132,32 @@ class TestClassification:
         cron regression where unresolved tools were silently dropped."""
         from tools.tool_search import is_deferrable_tool_name
         assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx")
+
+    def test_defer_core_policy_only_keeps_always_visible_core_tools(self):
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+        cfg = ToolSearchConfig.from_raw({
+            "defer_core": True,
+            "always_visible": ["clarify", "skill_view"],
+        })
+        assert is_deferrable_tool_name("read_file", cfg)
+        assert is_deferrable_tool_name("terminal", cfg)
+        assert not is_deferrable_tool_name("clarify", cfg)
+        assert not is_deferrable_tool_name("skill_view", cfg)
+
+    def test_unknown_tool_remains_visible_when_core_deferral_enabled(self):
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+        cfg = ToolSearchConfig.from_raw({"defer_core": True})
+        assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx", cfg)
+
+    def test_classify_with_defer_core_uses_same_policy(self):
+        from tools.tool_search import ToolSearchConfig, classify_tools
+        cfg = ToolSearchConfig.from_raw({"defer_core": True})
+        visible, deferred = classify_tools(
+            [_td("clarify"), _td("skill_view"), _td("read_file"), _td("terminal")],
+            config=cfg,
+        )
+        assert {t["function"]["name"] for t in visible} == {"clarify", "skill_view"}
+        assert {t["function"]["name"] for t in deferred} == {"read_file", "terminal"}
 
     def test_classify_keeps_unknown_in_visible(self):
         """A tool we can't classify stays visible — never silently dropped.
@@ -250,6 +296,25 @@ class TestAssembly:
         assert not result.activated
         assert {t["function"]["name"] for t in result.tool_defs} == {"terminal", "read_file"}
 
+    def test_defer_core_assembly_keeps_only_policy_visible_plus_bridges(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
+        defs = [
+            _td("clarify", "Ask"),
+            _td("skill_view", "Load skill"),
+            _td("read_file", "Read"),
+            _td("terminal", "Run"),
+        ]
+        result = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "defer_core": True}),
+        )
+        assert result.activated
+        assert {t["function"]["name"] for t in result.tool_defs} == {
+            "clarify", "skill_view", *BRIDGE_TOOL_NAMES,
+        }
+        assert result.deferred_count == 2
+
     def test_below_threshold_returns_unchanged(self):
         """Tiny deferrable surface: don't bother."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
@@ -352,6 +417,50 @@ class TestBridgeDispatch:
 
 
 class TestHandleFunctionCallIntegration:
+    def test_deferred_terminal_still_runs_command_approval_with_frozen_policy(
+        self, monkeypatch
+    ):
+        """Bridging a deferred core command must preserve its real guard path.
+
+        The explicit config also proves a session-frozen policy wins over a
+        later live-config change; otherwise terminal would become unreachable.
+        """
+        import model_tools
+        from tools import terminal_tool
+        from tools.tool_search import ToolSearchConfig
+
+        guarded = []
+
+        def deny(command, env_type, has_host_access=False):
+            guarded.append((command, env_type, has_host_access))
+            return {
+                "approved": False,
+                "description": "approval regression test",
+                "message": "denied by approval regression test",
+            }
+
+        monkeypatch.setattr(terminal_tool, "_check_all_guards", deny)
+        monkeypatch.setattr(
+            "tools.tool_search.load_config",
+            lambda: ToolSearchConfig.from_raw({"enabled": "off"}),
+        )
+        frozen = ToolSearchConfig.from_raw({
+            "enabled": "on", "defer_core": True
+        })
+
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "terminal",
+                "arguments": {"command": "echo must-not-run"},
+            },
+            tool_search_config=frozen,
+        ))
+
+        assert result["status"] == "blocked"
+        assert result["error"] == "denied by approval regression test"
+        assert guarded and guarded[0][0] == "echo must-not-run"
+
     def test_tool_search_dispatch_through_handle_function_call(self):
         """The dispatcher recognizes the bridge tool by name."""
         import model_tools

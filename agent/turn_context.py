@@ -1095,6 +1095,38 @@ def build_turn_context(
                 else _gateway_notes
             )
 
+    # Hybrid tool routing runs exactly once in this per-user-turn prologue, not
+    # once per tool-loop continuation.  Its bounded packet is appended to the
+    # API-only sidecar below, so the clean transcript stays unchanged while
+    # persisted replay remains byte-stable for provider prefix caching.
+    _tool_router_config = getattr(agent, "_tool_router_config", None)
+    if (
+        getattr(_tool_router_config, "enabled", False)
+        and isinstance(original_user_message, str)
+    ):
+        try:
+            from agent.tool_router import build_route_packet, route_turn
+
+            _route_decision = route_turn(
+                original_user_message,
+                getattr(agent, "_tool_router_catalog_defs", ()) or (),
+                config=_tool_router_config,
+            )
+            _route_packet = build_route_packet(_route_decision, _tool_router_config)
+            plugin_user_context = (
+                plugin_user_context + "\n\n" + _route_packet
+                if plugin_user_context
+                else _route_packet
+            )
+        except Exception as _route_exc:
+            # Routing is advisory. A router-internal fault must never block the
+            # main model or alter the searchable authorized tool catalog.
+            logger.warning(
+                "tool router failed open: error_type=%s",
+                type(_route_exc).__name__,
+            )
+
+
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()

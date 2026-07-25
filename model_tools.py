@@ -290,6 +290,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_search_config: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -332,6 +333,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            repr(tool_search_config) if tool_search_config is not None else None,
             _is_delegated_child_context(),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -344,8 +346,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        tool_search_config=tool_search_config,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -369,6 +376,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_search_config: Any = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -560,7 +568,7 @@ def _compute_tool_definitions(
     # case some caller invokes get_tool_definitions twice.
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
-        ts_cfg = _load_ts_config()
+        ts_cfg = tool_search_config or _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
@@ -1081,6 +1089,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    tool_search_config: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1124,6 +1133,11 @@ def handle_function_call(
         _ts_mod = None
 
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
+        # AIAgent freezes this policy when the session tool surface is built.
+        # Direct legacy callers may omit it and retain the prior live-config
+        # behavior, but an active session must never lose deferred tools merely
+        # because config.yaml changed mid-turn or mid-session.
+        _effective_ts_config = tool_search_config or _ts_mod.load_config()
         try:
             # Use skip_tool_search_assembly=True so we see the real catalog,
             # not the already-collapsed bridge-only list (the bridge would
@@ -1147,12 +1161,16 @@ def handle_function_call(
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
             return _ts_mod.dispatch_tool_search(function_args or {},
-                                                current_tool_defs=current_defs)
+                                                current_tool_defs=current_defs,
+                                                config=_effective_ts_config)
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
             return _ts_mod.dispatch_tool_describe(function_args or {},
-                                                  current_tool_defs=current_defs)
+                                                  current_tool_defs=current_defs,
+                                                  config=_effective_ts_config)
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {}, config=_effective_ts_config
+            )
             if err or not underlying_name:
                 return json.dumps({"error": err or "tool_call could not be resolved"},
                                   ensure_ascii=False)
@@ -1162,7 +1180,9 @@ def handle_function_call(
             # additionally rejects any tool the session was not granted, so a
             # restricted session can never invoke an out-of-scope tool through
             # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+            _scoped_deferrable = _ts_mod.scoped_deferrable_names(
+                current_defs, config=_effective_ts_config
+            )
             if underlying_name not in _scoped_deferrable:
                 return json.dumps({
                     "error": (
@@ -1185,6 +1205,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                tool_search_config=_effective_ts_config,
             )
 
     _tool_original_args = dict(function_args)

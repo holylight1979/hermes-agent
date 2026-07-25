@@ -2957,28 +2957,48 @@ DEFAULT_CONFIG = {
     # in the model-facing tools array with three bridge tools —
     # tool_search / tool_describe / tool_call — and surfaced on demand.
     #
-    # Core Hermes tools (terminal, read_file, write_file, patch,
-    # search_files, todo, memory, browser_*, etc.) are NEVER deferred.
-    # See tools/tool_search.py for full design notes and the
-    # openclaw-tool-search-report PDF in this PR for the rationale.
+    # Core tools remain visible by default. ``defer_core`` is an explicit
+    # opt-in used with the hybrid pre-router; unknown/unregistered names never
+    # defer, and ``always_visible`` tools plus the three bridges remain fixed.
+    # See tools/tool_search.py and agent/tool_router.py for safety invariants.
     "tools": {
         "tool_search": {
             # "auto" (default) — activate only when deferrable tool schemas
             #   exceed ``threshold_pct`` of the active model's context length,
             #   so small toolsets pay no overhead.
             # "on"  — always activate when there is at least one deferrable
-            #   tool. Use when you have many MCP servers and want maximum
-            #   token reduction unconditionally.
+            #   tool. Use with defer_core for a fixed five-tool main surface.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
             "enabled": "auto",
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,
+            # Opt-in: allow registered Hermes core tools to move behind the
+            # bridge. False preserves legacy behavior.
+            "defer_core": False,
+            # These tools remain direct even when defer_core is true. Bridge
+            # names are always visible independently of this list.
+            "always_visible": ["clarify", "skill_view"],
             # When the model calls tool_search without a ``limit`` argument,
             # how many hits to return. Range 1..max_search_limit.
             "search_default_limit": 5,
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
+        },
+        # Hybrid rule/AI pre-router. Disabled by default: enabling it never
+        # grants tools and all failures leave the authorized bridge catalog open.
+        "tool_router": {
+            "enabled": False,
+            "mode": "hybrid",
+            "provider": "rdchat-direct",
+            "model": "gemma4:e4b-64k",
+            "timeout_seconds": 4,
+            "confidence_threshold": 0.75,
+            "max_candidates": 6,
+            "max_packet_tokens": 1800,
+            "include_compact_schemas": True,
+            "fail_open": True,
+            "telemetry": True,
         },
     },
 

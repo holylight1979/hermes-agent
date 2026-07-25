@@ -1375,12 +1375,48 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+
+    # Load tools based on configuration.  The optional hybrid router keeps a
+    # session-scoped snapshot of every already-authorized schema while the main
+    # model receives the progressively disclosed surface assembled below.
+    from agent.tool_router import load_config as load_tool_router_config
+    from tools.tool_search import load_config as load_tool_search_config
+
+    agent._tool_router_config = load_tool_router_config()
+    agent._tool_search_config = load_tool_search_config()
+    if agent._tool_router_config.enabled and (
+        agent._tool_search_config.enabled == "off"
+        or not agent._tool_search_config.defer_core
+    ):
+        # A route packet only saves tokens when the main surface is actually
+        # collapsed. Silently running it against a fully-visible core surface
+        # adds latency/tokens with no benefit, so disable it for this session.
+        from dataclasses import replace as _dataclass_replace
+
+        logger.warning(
+            "tool_router disabled for this session: requires "
+            "tools.tool_search.enabled != off and defer_core=true"
+        )
+        agent._tool_router_config = _dataclass_replace(
+            agent._tool_router_config, enabled=False
+        )
+
+    agent._tool_router_catalog_defs = []
+    if agent._tool_router_config.enabled:
+        agent._tool_router_catalog_defs = _ra().get_tool_definitions(
+            quiet_mode=quiet_mode,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            skip_tool_search_assembly=True,
+        )
+
     agent.tools = _ra().get_tool_definitions(
+        quiet_mode=quiet_mode,
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
+        tool_search_config=agent._tool_search_config,
     )
-    
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
