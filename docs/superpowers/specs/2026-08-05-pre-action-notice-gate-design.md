@@ -125,3 +125,37 @@ agent:
 - 將 `agent.require_pre_action_notice` 設為 `false` 可停用行為。
 - 若需完整撤回，可還原本次本機程式提交，以及設定備份：
   `C:\Users\holylight\AppData\Local\hermes\config.yaml.pre-action-20260805-145655.bak`。
+
+## 2026-08-05 E2E 修訂：兩階段預告
+
+### 實證原因
+
+真實 `openai-codex/gpt-5.6-sol` 新 session 連續三次回傳只有 tool call、沒有同回合可見 content；即使使用者明確要求固定預告文字仍相同。原閘門正確阻止所有工具並保持 session DB 無未配對 tool call，但無法完成正常工作。因此不得再假設供應商能可靠產生「可見文字＋tool call」同一回合。
+
+### 修訂流程
+
+1. 首次收到無合格預告的工具批次：整批捨棄，零副作用。
+2. 進入 `awaiting_notice` 狀態，內部提示模型下一回合只輸出預告文字，不得呼叫工具。
+3. 若文字不合格，按既有重試預算繼續要求；耗盡則停止。
+4. 若文字合格：
+   - 立即以 interim assistant 訊息顯示給使用者。
+   - 將模型原文暫存在本回合狀態；不得由 Hermes 改寫或杜撰。
+   - 該 notice-only 回合標記為 ephemeral，暫不寫入正式 session，避免之後形成相鄰 assistant 訊息。
+   - 追加 ephemeral user continue，要求模型現在重新發出原本需要的工具呼叫。
+5. 下一個工具批次抵達時：
+   - 僅當存在剛剛由模型產生且已顯示的合格暫存 notice，才允許空 content 的工具批次通過。
+   - 在持久化與派送前，把該模型原文附回這個 assistant(tool_calls) 訊息的 content；不得重複顯示。
+   - 清除暫存與 armed 狀態，然後才執行工具。
+6. 若 armed 後模型改為一般文字回答、再次產生不合格工具批次、回合失敗或中止，必須清除暫存，不能讓舊 notice 授權未來工具。
+
+### 新增不變量
+
+- 使用者可見順序必須是：模型產生的合格預告 → 工具執行／結果。
+- armed notice 只能授權緊接的一個工具批次，不能跨回合、壓縮、resume 或錯誤路徑重用。
+- 正式 session DB 最終必須保存為單一 assistant(content=該預告, tool_calls=...) → tool result，不得保存 notice-only assistant 與隱藏 continue 造成的雙 assistant。
+- 已顯示的預告不得因附回持久訊息而在 CLI/Gateway 重複輸出。
+- 功能關閉時仍維持既有行為。
+
+### 修訂驗證
+
+除原測試外，新增：notice-only 不執行工具、合格 notice 立即顯示、下一批空 content tool call 被附上同一原文後只執行一次、DB 無雙 assistant、armed 僅一次且各種中止路徑清除、CLI 不重複顯示。正向真實 E2E 必須看到預告後才看到 `PREACTION_GATE_E2E_OK`；否則不得宣稱完成。

@@ -370,3 +370,36 @@ git commit -m "test(agent): verify pre-action notice gate end to end"
 未完成或限制：<如實列出>
 回復方式：<設定關閉與備份位置>
 ```
+
+## 核准修訂工作：兩階段預告相容路徑
+
+### Task A：先建立失敗測試
+
+在 `tests/run_agent/test_pre_action_notice_gate.py` 增加：
+
+1. 無預告 tool call 被捨棄後，nudge 要求「只輸出預告文字，不呼叫工具」。
+2. 合格 notice-only 回合會立即 emit interim，但 handler 仍為 0。
+3. 接續空 content tool call 使用暫存的模型原文通過，handler 僅呼叫一次。
+4. 持久 messages 最終只有一個帶同一 notice content 的 assistant(tool_calls)，接著 tool result；沒有 notice-only assistant 或 synthetic continue。
+5. interim callback 只收到 notice 一次，不因 content 附回而重複顯示。
+6. armed notice 只授權一批；一般文字結束、重試耗盡、例外及新 user turn 都清除。
+
+先執行新測試，Expected: 至少上述兩階段案例失敗，證明測試真的覆蓋缺口。
+
+### Task B：最小兩階段狀態機
+
+修改 `agent/conversation_loop.py`、`agent/pre_action_notice.py`，必要時在 `agent/agent_init.py` 初始化：
+
+- `_pre_action_notice_phase`: `idle | awaiting_notice | armed`
+- `_pre_action_notice_text`: 僅保存模型產生且已通過 validator 的當回合文字
+- 第一次拒絕後要求 notice-only。
+- awaiting_notice 收到合格純文字時，使用既有 `_emit_interim_assistant_message` 顯示；把 notice 回合與 continue 標記為 `_pre_action_notice_synthetic`，不持久化。
+- armed 收到下一批 tool calls 時，把暫存原文設為該 assistant message 的 content，通過閘門並在派送前原子清除 armed/text。
+- 不重複 stream／print 已顯示內容。
+- 所有終止與錯誤路徑 fail closed 並清除 armed/text。
+
+不要新增 LLM、工具 schema、背景服務或自動生成的通用目標。
+
+### Task C：回歸與真實驗證
+
+重新執行原 52 項目標測試、29 項相鄰回歸測試及新增兩階段測試。由 Hermes 另行執行兩個真實新 session：一般工具要求與明確格式要求。兩者都必須先顯示模型預告，再執行 sentinel 命令；session DB 必須呈現合法配對。負向 deterministic 測試必須維持零副作用。
