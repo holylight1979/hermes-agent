@@ -94,6 +94,27 @@ def _run(agent, handler, message="請執行測試命令"):
     return result, mock_hfc
 
 
+def _capture_interim(agent):
+    """Record every text the agent pushes through the interim callback."""
+    seen = []
+
+    def _cb(text, already_streamed=False):
+        seen.append(text)
+
+    agent.interim_assistant_callback = _cb
+    return seen
+
+
+def _durable(messages):
+    """The rows that would survive into the session DB."""
+    from run_agent import _is_ephemeral_scaffolding
+
+    return [
+        m for m in messages
+        if isinstance(m, dict) and not _is_ephemeral_scaffolding(m)
+    ]
+
+
 def _ok_handler(*_args, **_kwargs):
     return "PREACTION_SMOKE_OK"
 
@@ -480,9 +501,9 @@ class TestScaffoldingIsEphemeral:
             if isinstance(m.get("content"), str) and "重新發出" in m["content"]
         ]
 
-    def test_unanswered_trailing_pair_is_stripped_at_finalization(self):
-        """If the model gives up on tools and answers in text instead, the
-        dangling scaffolding must not trail the final answer."""
+    def test_invalid_notice_exhaustion_strips_trailing_scaffolding(self):
+        """Invalid notice-only replies consume the bounded retry budget; once
+        exhausted the turn stops cleanly and no synthetic pair is persisted."""
         agent = _build_agent(enabled=True)
         agent.client.chat.completions.create.side_effect = [
             _response(
@@ -491,12 +512,323 @@ class TestScaffoldingIsEphemeral:
                 tool_calls=[_tool_call("terminal", "call_blank")],
             ),
             _response(content="改用文字回答。", finish_reason="stop"),
+            _response(content="仍然沒有合格預告。", finish_reason="stop"),
         ]
 
-        result, _ = _run(agent, _ok_handler)
+        result, mock_hfc = _run(agent, _ok_handler)
 
-        assert result["final_response"] == "改用文字回答。"
+        assert mock_hfc.call_count == 0
+        assert result["completed"] is False
+        assert "已停止" in result["final_response"]
         assert not [
             m for m in result["messages"]
             if isinstance(m, dict) and m.get("_pre_action_notice_synthetic")
         ]
+
+
+# ── Two-stage notice (2026-08-05 E2E revision) ────────────────────────
+# Two real openai-codex/gpt-5.6-sol sessions proved the provider will not
+# put visible content in the same turn as a tool call, even when the user
+# asks for it verbatim. The single-stage gate above then correctly stops
+# every turn — correct, but unusable. The revision splits the requirement
+# in two: the model says what it is about to do in a text-only turn, Hermes
+# shows that text, and the *next* tool batch is authorised by it.
+#
+# What must not weaken: the batch still reaches the handler only after the
+# user has seen a model-authored notice.
+
+STAGE_TWO_NOTICE = "執行目標：執行 sentinel 命令並回報輸出。預估約 30 秒。"
+
+
+def _two_stage_responses(*, tail="完成。"):
+    """blank+tools → notice-only text → blank+tools → final answer."""
+    return [
+        _response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("terminal", "call_blank")],
+        ),
+        _response(content=STAGE_TWO_NOTICE, finish_reason="stop"),
+        _response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("terminal", "call_armed")],
+        ),
+        _response(content=tail, finish_reason="stop"),
+    ]
+
+
+class TestTwoStageNotice:
+    def test_nudge_asks_for_a_text_only_notice(self):
+        """Stage 1's nudge must ask for the notice ALONE.
+
+        The old wording asked for "notice + tool calls in the same turn" —
+        exactly what the provider demonstrably cannot do. Asking for a
+        text-only turn is the whole point of the revision.
+        """
+        from agent.pre_action_notice import PRE_ACTION_NOTICE_NUDGE
+
+        assert "執行目標" in PRE_ACTION_NOTICE_NUDGE
+        assert "預估" in PRE_ACTION_NOTICE_NUDGE
+        assert "不要呼叫" in PRE_ACTION_NOTICE_NUDGE, (
+            "The nudge must forbid tool calls in the notice turn."
+        )
+
+    def test_notice_only_turn_is_shown_but_runs_no_tools(self):
+        """The qualifying text-only turn reaches the user immediately, and
+        still nothing has executed at that point."""
+        agent = _build_agent(enabled=True)
+        seen = _capture_interim(agent)
+        seen_when_dispatched = []
+
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        def _handler(*_args, **_kwargs):
+            seen_when_dispatched.append(list(seen))
+            return "PREACTION_GATE_E2E_OK"
+
+        _result, mock_hfc = _run(agent, _handler)
+
+        assert mock_hfc.call_count == 1
+        assert seen_when_dispatched[0] == [STAGE_TWO_NOTICE], (
+            "The notice must already be on screen when the first tool runs."
+        )
+
+    def test_armed_notice_authorizes_the_next_blank_tool_batch(self):
+        agent = _build_agent(enabled=True)
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        result, mock_hfc = _run(agent, _ok_handler)
+
+        assert mock_hfc.call_count == 1, (
+            "The armed notice must let exactly one batch through."
+        )
+        executed = {
+            m.get("tool_call_id")
+            for m in result["messages"]
+            if isinstance(m, dict) and m.get("role") == "tool"
+        }
+        assert executed == {"call_armed"}
+        assert result["final_response"] == "完成。"
+
+    def test_durable_transcript_is_one_assistant_then_tool_result(self):
+        """The session DB must end up with the shape a provider accepts on
+        resume: assistant(content=the model's own notice, tool_calls=...)
+        immediately followed by its tool result — no notice-only assistant,
+        no synthetic continue, no adjacent assistant pair."""
+        agent = _build_agent(enabled=True)
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        result, _ = _run(agent, _ok_handler)
+
+        durable = _durable(result["messages"])
+        tool_turns = [m for m in durable if m.get("tool_calls")]
+        assert len(tool_turns) == 1
+        assert tool_turns[0]["role"] == "assistant"
+        assert tool_turns[0]["content"] == STAGE_TWO_NOTICE, (
+            "The persisted tool-call turn must carry the model's own notice, "
+            "not a Hermes-authored stand-in."
+        )
+
+        idx = durable.index(tool_turns[0])
+        assert durable[idx + 1]["role"] == "tool"
+
+        # No standalone notice-only assistant and no hidden continue survive.
+        assert not [
+            m for m in durable
+            if m.get("role") == "assistant"
+            and not m.get("tool_calls")
+            and m.get("content") == STAGE_TWO_NOTICE
+        ]
+        roles = [m.get("role") for m in durable]
+        assert not any(
+            roles[i] == "assistant" and roles[i + 1] == "assistant"
+            for i in range(len(roles) - 1)
+        ), f"adjacent assistant messages in the durable transcript: {roles}"
+
+    def test_notice_is_displayed_exactly_once(self):
+        """Re-attaching the notice to the persisted tool-call turn must not
+        make the CLI/gateway print it a second time."""
+        agent = _build_agent(enabled=True)
+        seen = _capture_interim(agent)
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        _run(agent, _ok_handler)
+
+        assert seen.count(STAGE_TWO_NOTICE) == 1, seen
+
+
+class TestArmedStateFailsClosed:
+    def test_armed_state_is_consumed_by_a_single_batch(self):
+        """A second blank batch after the authorised one is gated again."""
+        agent = _build_agent(enabled=True, max_retries=1)
+        agent.client.chat.completions.create.side_effect = [
+            *_two_stage_responses()[:3],
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_second")],
+            ),
+            _response(content="仍然沒有合格預告。", finish_reason="stop"),
+        ]
+
+        result, mock_hfc = _run(agent, _ok_handler)
+
+        assert mock_hfc.call_count == 1, (
+            "The stashed notice must not authorise a second batch."
+        )
+        assert result["completed"] is False
+        assert "已停止" in result["final_response"]
+
+    def test_state_is_cleared_before_the_batch_is_dispatched(self):
+        """Cleared *before* dispatch, so a tool that crashes, restarts Hermes
+        or re-enters the loop cannot find a live authorisation."""
+        agent = _build_agent(enabled=True)
+        observed = {}
+
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        def _handler(*_args, **_kwargs):
+            observed["phase"] = agent._pre_action_notice_phase
+            observed["text"] = agent._pre_action_notice_text
+            return "ok"
+
+        _run(agent, _handler)
+
+        assert observed["phase"] == "idle"
+        assert observed["text"] is None
+
+    def test_ordinary_text_answer_clears_the_armed_notice(self):
+        agent = _build_agent(enabled=True)
+        agent.client.chat.completions.create.side_effect = [
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_blank")],
+            ),
+            _response(content=STAGE_TWO_NOTICE, finish_reason="stop"),
+            _response(content="其實不需要工具，直接回答你。", finish_reason="stop"),
+        ]
+
+        result, mock_hfc = _run(agent, _ok_handler)
+
+        assert mock_hfc.call_count == 0
+        assert result["final_response"] == "其實不需要工具，直接回答你。"
+        assert agent._pre_action_notice_phase == "idle"
+        assert agent._pre_action_notice_text is None
+
+    def test_retry_exhaustion_clears_the_armed_notice(self):
+        agent = _build_agent(enabled=True, max_retries=1)
+        agent.client.chat.completions.create.side_effect = [
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_blank")],
+            ),
+            _response(content=STAGE_TWO_NOTICE, finish_reason="stop"),
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_armed")],
+            ),
+            # Armed batch ran; this one has to earn its own notice.
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_x")],
+            ),
+            _response(content="仍然沒有預告。", finish_reason="stop"),
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_y")],
+            ),
+        ]
+
+        result, mock_hfc = _run(agent, _ok_handler)
+
+        assert mock_hfc.call_count == 1
+        assert result["completed"] is False
+        assert agent._pre_action_notice_phase == "idle"
+        assert agent._pre_action_notice_text is None
+
+    def test_a_new_user_turn_does_not_inherit_an_armed_notice(self):
+        """State left over from a previous turn (gateway agents are cached,
+        and a crash can leave the flag set) must not authorise anything."""
+        agent = _build_agent(enabled=True, max_retries=0)
+        agent._pre_action_notice_phase = "armed"
+        agent._pre_action_notice_text = STAGE_TWO_NOTICE
+        agent.client.chat.completions.create.side_effect = [
+            _response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_tool_call("terminal", "call_stale")],
+            ),
+        ]
+
+        result, mock_hfc = _run(agent, _ok_handler)
+
+        assert mock_hfc.call_count == 0, (
+            "A stale notice from an earlier turn must never authorise tools."
+        )
+        assert result["completed"] is False
+
+    def test_notice_state_starts_idle_from_agent_init(self):
+        agent = _build_agent(enabled=False)
+
+        assert agent._pre_action_notice_phase == "idle"
+        assert agent._pre_action_notice_text is None
+
+
+class TestTwoStageScaffoldingIsEphemeral:
+    def test_notice_turn_and_continue_are_flagged_and_stripped(self):
+        from agent.pre_action_notice import build_pre_action_notice_continuation
+        from run_agent import _is_ephemeral_scaffolding
+
+        notice_msg, continue_msg = build_pre_action_notice_continuation(
+            STAGE_TWO_NOTICE
+        )
+
+        assert notice_msg["role"] == "assistant"
+        assert notice_msg["content"] == STAGE_TWO_NOTICE
+        assert "tool_calls" not in notice_msg
+        assert continue_msg["role"] == "user"
+        assert _is_ephemeral_scaffolding(notice_msg)
+        assert _is_ephemeral_scaffolding(continue_msg)
+
+    def test_internal_fields_never_reach_the_provider(self):
+        """The two-stage scaffolding rides in live memory only; strict
+        gateways reject unknown message fields."""
+        agent = _build_agent(enabled=True)
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        _run(agent, _ok_handler)
+
+        for call in agent.client.chat.completions.create.call_args_list:
+            msgs = call.kwargs.get("messages") or call.args[0].get("messages")
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                assert not [
+                    k for k in msg if isinstance(k, str) and k.startswith("_")
+                ], f"internal field leaked to the provider: {msg!r}"
+
+    def test_armed_request_keeps_role_alternation(self):
+        """The request that carries the tool batch must still alternate:
+        ... assistant(notice) → user(continue)."""
+        agent = _build_agent(enabled=True)
+        agent.client.chat.completions.create.side_effect = _two_stage_responses()
+
+        _run(agent, _ok_handler)
+
+        third = agent.client.chat.completions.create.call_args_list[2]
+        msgs = third.kwargs.get("messages") or third.args[0].get("messages")
+
+        assert msgs[-1]["role"] == "user"
+        assert msgs[-2]["role"] == "assistant"
+        assert msgs[-2]["content"] == STAGE_TWO_NOTICE
+        assert not msgs[-2].get("tool_calls")
+        roles = [m["role"] for m in msgs if isinstance(m, dict)]
+        assert not any(
+            roles[i] == roles[i + 1] == "assistant" for i in range(len(roles) - 1)
+        ), roles

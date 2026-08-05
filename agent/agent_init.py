@@ -1821,6 +1821,17 @@ def init_agent(
     # Consecutive gate rejections in the current turn; reset once a batch is
     # cleared for dispatch (see agent/conversation_loop.py).
     agent._pre_action_notice_retries = 0
+    # Two-stage handshake state (see agent/conversation_loop.py):
+    #   idle            — nothing pending
+    #   awaiting_notice — a batch was discarded; the model owes a text-only
+    #                     notice before it may call tools again
+    #   armed           — a qualifying notice was shown to the user and may
+    #                     authorise exactly the next tool batch
+    # Both fields are in-memory and per-turn: they are re-set at the top of
+    # every run_conversation, so nothing survives a resume, a compaction or a
+    # crashed turn to authorise tools it never announced.
+    agent._pre_action_notice_phase = "idle"
+    agent._pre_action_notice_text = None
 
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt

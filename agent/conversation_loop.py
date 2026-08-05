@@ -75,6 +75,7 @@ from agent.model_metadata import (
 )
 from agent.pre_action_notice import (
     PRE_ACTION_NOTICE_STOP,
+    build_pre_action_notice_continuation,
     build_pre_action_notice_scaffolding,
     has_valid_pre_action_notice,
 )
@@ -1295,6 +1296,15 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+
+    # Same reason, higher stakes: an armed pre-action notice authorises a tool
+    # batch. It is scoped to one stall inside one turn, so a new user turn —
+    # or a turn that crashed while armed — always starts from zero. A stale
+    # authorisation would let a batch run behind a notice the user was shown
+    # for something else entirely.
+    agent._pre_action_notice_phase = "idle"
+    agent._pre_action_notice_text = None
+    agent._pre_action_notice_retries = 0
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -5956,6 +5966,97 @@ def run_conversation(
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
+
+            # ── Pre-action notice: text-only half of the two-stage gate ──
+            # Some providers cannot place visible content beside tool calls.
+            # After an unannounced batch is discarded, intercept the model's
+            # next qualifying text response *before* normal text finalization,
+            # show it once, and arm exactly the immediately following batch.
+            if (
+                getattr(agent, "require_pre_action_notice", False)
+                and not assistant_message.tool_calls
+            ):
+                _pan_phase = getattr(agent, "_pre_action_notice_phase", "idle")
+                if _pan_phase == "awaiting_notice":
+                    _pan_notice_text = agent._strip_think_blocks(
+                        assistant_message.content or ""
+                    ).strip()
+                    if has_valid_pre_action_notice(_pan_notice_text):
+                        agent._pre_action_notice_phase = "armed"
+                        agent._pre_action_notice_text = _pan_notice_text
+                        # This is the model's own text and is the actual notice
+                        # the user must see before any tool can run.
+                        agent._emit_interim_assistant_message({
+                            "role": "assistant",
+                            "content": _pan_notice_text,
+                        })
+                        _pan_notice_msg, _pan_continue = (
+                            build_pre_action_notice_continuation(_pan_notice_text)
+                        )
+                        messages.append(_pan_notice_msg)
+                        messages.append(_pan_continue)
+                        agent._session_messages = messages
+                        final_response = None
+                        continue
+
+                    # The notice-only response was not a valid notice. Keep
+                    # the retry bounded just like an unannounced tool batch;
+                    # otherwise a provider could silently turn the gate into
+                    # an ordinary text answer and never perform the requested
+                    # action.
+                    _pan_max = getattr(agent, "pre_action_notice_max_retries", 2)
+                    _pan_used = getattr(agent, "_pre_action_notice_retries", 0)
+                    if _pan_used < _pan_max:
+                        agent._pre_action_notice_retries = _pan_used + 1
+                        _pan_assistant, _pan_nudge = (
+                            build_pre_action_notice_scaffolding(_pan_notice_text)
+                        )
+                        messages.append(_pan_assistant)
+                        messages.append(_pan_nudge)
+                        agent._session_messages = messages
+                        agent._emit_status(
+                            "⏸ 預告格式仍不完整：正在再次要求執行目標與時間預估 "
+                            f"({agent._pre_action_notice_retries}/{_pan_max})"
+                        )
+                        final_response = None
+                        continue
+
+                    agent._pre_action_notice_phase = "idle"
+                    agent._pre_action_notice_text = None
+                    agent._pre_action_notice_retries = 0
+                    while (
+                        messages
+                        and isinstance(messages[-1], dict)
+                        and messages[-1].get("_pre_action_notice_synthetic")
+                    ):
+                        messages.pop()
+                    final_response = PRE_ACTION_NOTICE_STOP
+                    agent._emit_status("⛔ 已停止：缺少執行前預告，未執行任何新工具")
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._safe_print(f"\n{final_response}\n")
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(final_response)
+                            agent.stream_delta_callback(None)
+                        except Exception:
+                            pass
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "error": final_response,
+                        "turn_exit_reason": "pre_action_notice_missing",
+                    }
+                elif _pan_phase == "armed":
+                    # An armed notice is single-use and only covers an
+                    # immediately following tool batch. A text response spends
+                    # it without side effects.
+                    agent._pre_action_notice_phase = "idle"
+                    agent._pre_action_notice_text = None
+                    agent._pre_action_notice_retries = 0
             
             # Check for tool calls
             if assistant_message.tool_calls:
@@ -5970,15 +6071,58 @@ def run_conversation(
                 # the pre-execution session flush, or the interim emit.
                 # Think-block text is stripped first: hidden reasoning is not
                 # a notice the user can see.
+                #
+                # Two-stage path: providers exist (openai-codex/gpt-5.6-sol,
+                # observed twice on real sessions) that never put visible
+                # content in a tool-call turn, whatever the user asks for. For
+                # those, the notice arrives as its own text-only turn, gets
+                # shown, and authorises exactly the batch that follows —
+                # ``_pan_attached`` records that this batch is running behind
+                # such a notice, so the loop below does not display it twice.
+                _pan_attached = False
                 if getattr(agent, "require_pre_action_notice", False):
                     _notice_text = agent._strip_think_blocks(
                         assistant_message.content or ""
                     )
-                    if not has_valid_pre_action_notice(_notice_text):
+                    # An armed notice only authorises a batch that says
+                    # nothing itself. Any other content is the model talking
+                    # over its own announcement — re-gate it.
+                    _pan_armed_text = (
+                        getattr(agent, "_pre_action_notice_text", None)
+                        if getattr(agent, "_pre_action_notice_phase", "idle") == "armed"
+                        else None
+                    )
+                    if (
+                        _pan_armed_text
+                        and not _notice_text.strip()
+                        and not has_valid_pre_action_notice(_notice_text)
+                    ):
+                        # Attach the model's own announcement to the turn that
+                        # is about to run, so the durable transcript holds one
+                        # assistant(notice, tool_calls) → tool result pair
+                        # instead of a notice-only row plus an unannounced
+                        # batch. Disarm FIRST: nothing after this point may
+                        # find a live authorisation, however it exits.
+                        agent._pre_action_notice_phase = "idle"
+                        agent._pre_action_notice_text = None
+                        agent._pre_action_notice_retries = 0
+                        assistant_message.content = _pan_armed_text
+                        _pan_attached = True
+                        logger.info(
+                            "Pre-action notice satisfied out of band — "
+                            "authorising %d tool call(s) with the notice "
+                            "already shown to the user",
+                            len(assistant_message.tool_calls),
+                        )
+                    elif not has_valid_pre_action_notice(_notice_text):
                         _pan_max = getattr(agent, "pre_action_notice_max_retries", 2)
                         _pan_used = getattr(agent, "_pre_action_notice_retries", 0)
                         _n_calls = len(assistant_message.tool_calls)
+                        # Whatever happens next, an armed notice does not
+                        # survive a batch it failed to cover.
+                        agent._pre_action_notice_text = None
                         if _pan_used < _pan_max:
+                            agent._pre_action_notice_phase = "awaiting_notice"
                             agent._pre_action_notice_retries = _pan_used + 1
                             logger.warning(
                                 "Pre-action notice missing — discarding %d tool "
@@ -6017,6 +6161,7 @@ def run_conversation(
                             _pan_max, _n_calls, agent.model,
                         )
                         agent._pre_action_notice_retries = 0
+                        agent._pre_action_notice_phase = "idle"
                         # Drop the trailing scaffolding so the stop message
                         # follows the last real turn instead of an internal
                         # nudge.
@@ -6050,9 +6195,14 @@ def run_conversation(
                             "turn_exit_reason": _turn_exit_reason,
                         }
 
-                    # Cleared for dispatch — the next stall gets a fresh
-                    # budget rather than inheriting this turn's.
-                    agent._pre_action_notice_retries = 0
+                    else:
+                        # Announced in the same turn — the single-stage happy
+                        # path. The next stall gets a fresh budget rather than
+                        # inheriting this turn's, and any armed notice is
+                        # spent here rather than left to cover a later batch.
+                        agent._pre_action_notice_phase = "idle"
+                        agent._pre_action_notice_text = None
+                        agent._pre_action_notice_retries = 0
 
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")

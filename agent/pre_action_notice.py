@@ -71,13 +71,28 @@ def has_valid_pre_action_notice(content: object) -> bool:
 # what to do instead. Kept here, next to the predicate, so the wording and the
 # rule it enforces cannot drift apart.
 
+# Stage 1 of the two-stage handshake. The original wording asked for a
+# notice and the tool calls in the SAME turn — two real
+# openai-codex/gpt-5.6-sol sessions showed that provider never emits visible
+# content alongside a tool call, even when the user dictates the exact text,
+# so that instruction could only ever fail. This asks for the notice alone;
+# the tool calls are requested back in stage 2, once the notice is on screen.
 PRE_ACTION_NOTICE_NUDGE = (
     "你剛才的回合直接發出工具呼叫，但沒有先向使用者說明。系統已捨棄那批工具呼叫，"
     "沒有執行任何工具。\n"
-    "請先用繁體中文輸出一段白話預告，必須同時包含：\n"
+    "這個回合請「只」輸出一段繁體中文白話預告，不要呼叫任何工具，必須同時包含：\n"
     "1. 「執行目標：」後面接這次要完成的具體事情。\n"
     "2. 「預估」或「概估」後面接大概需要的時間。\n"
-    "輸出預告之後，在同一個回合重新發出你原本需要的工具呼叫。"
+    "系統會把這段預告顯示給使用者，然後在下一個回合請你重新發出原本需要的工具呼叫。"
+)
+
+# Stage 2. Sent immediately after a qualifying notice-only turn has been
+# shown to the user. The notice text itself is already on screen and is
+# re-attached to the upcoming tool-call turn for persistence, so the model is
+# told not to repeat it.
+PRE_ACTION_NOTICE_CONTINUE = (
+    "你的預告已經顯示給使用者了。現在請直接發出你原本需要的工具呼叫，"
+    "不需要再重複那段預告文字。"
 )
 
 PRE_ACTION_NOTICE_STOP = (
@@ -115,10 +130,35 @@ def build_pre_action_notice_scaffolding(content: object) -> tuple[dict, dict]:
     )
 
 
+def build_pre_action_notice_continuation(notice: str) -> tuple[dict, dict]:
+    """Return the ephemeral (notice turn, continue) pair that arms the gate.
+
+    ``notice`` is the model's own qualifying text, already shown to the user.
+    It is replayed verbatim so the follow-up request still reads as a normal
+    assistant → user exchange, and both halves are flagged: the notice is
+    re-attached to the tool-call turn that follows, and persisting it here as
+    well would leave two adjacent assistant rows saying the same thing.
+    """
+    return (
+        {
+            "role": "assistant",
+            "content": notice,
+            "_pre_action_notice_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": PRE_ACTION_NOTICE_CONTINUE,
+            "_pre_action_notice_synthetic": True,
+        },
+    )
+
+
 __all__ = [
     "has_valid_pre_action_notice",
     "build_pre_action_notice_scaffolding",
+    "build_pre_action_notice_continuation",
     "PRE_ACTION_NOTICE_NUDGE",
+    "PRE_ACTION_NOTICE_CONTINUE",
     "PRE_ACTION_NOTICE_STOP",
     "PRE_ACTION_NOTICE_PLACEHOLDER",
 ]
