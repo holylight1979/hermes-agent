@@ -1796,6 +1796,32 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Pre-action notice gate.  When on, a turn carrying tool calls must first
+    # say — in plain Traditional Chinese — what it is about to do
+    # ("執行目標：...") and roughly how long it will take ("預估"/"概估").  The
+    # conversation loop discards a non-conforming batch before dispatch and
+    # re-prompts up to `pre_action_notice_max_retries` times.  Default OFF so
+    # existing users see today's behaviour unchanged.
+    agent.require_pre_action_notice = bool(
+        _agent_section.get("require_pre_action_notice", False)
+    )
+    # A bad value must never break startup: anything that is not a
+    # non-negative plain int (strings, floats, None, containers, negatives)
+    # falls back to the shipped default.  ``bool`` is an ``int`` subclass, so
+    # it is rejected explicitly — `true` is not a retry count.
+    _raw_retries = _agent_section.get("pre_action_notice_max_retries", 2)
+    if isinstance(_raw_retries, bool) or not isinstance(_raw_retries, int) or _raw_retries < 0:
+        if _raw_retries != 2:
+            logger.warning(
+                "Invalid agent.pre_action_notice_max_retries=%r — falling back to 2",
+                _raw_retries,
+            )
+        _raw_retries = 2
+    agent.pre_action_notice_max_retries = _raw_retries
+    # Consecutive gate rejections in the current turn; reset once a batch is
+    # cleared for dispatch (see agent/conversation_loop.py).
+    agent._pre_action_notice_retries = 0
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

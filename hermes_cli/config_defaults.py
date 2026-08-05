@@ -146,6 +146,17 @@ DEFAULT_CONFIG = {
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
         "max_verify_nudges": 3,
+        # Pre-action notice gate: when true, a turn carrying tool calls must
+        # first state, in plain Traditional Chinese, what it is about to do
+        # ("執行目標：...") and roughly how long it will take ("預估"/"概估").
+        # A turn that fails the check never reaches tool dispatch — the batch
+        # is discarded and the model is re-prompted; once the retries below are
+        # spent the turn stops with a visible notice and zero tool side
+        # effects. Default false: existing users keep today's behaviour.
+        "require_pre_action_notice": False,
+        # Consecutive re-prompts allowed before the gate stops the turn. 0
+        # means fail on the first unacceptable notice.
+        "pre_action_notice_max_retries": 2,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded
