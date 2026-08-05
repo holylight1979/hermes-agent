@@ -86,6 +86,13 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
+# Reserved model_config key holding the content-free fidelity audit record of
+# the compaction that produced a continuation child. Stored inside the existing
+# model_config JSON (like `_branched_from`) so provenance is written by the same
+# publication transaction as the child row — no parallel store, no new column.
+COMPRESSION_FIDELITY_CONFIG_KEY = "_compression_fidelity"
+
+
 # Rows that surface in pickers: roots + branch children (subagent runs and
 # compression continuations stay hidden).
 _LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"

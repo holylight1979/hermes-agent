@@ -685,6 +685,30 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        "fidelity_guard": False,      # Opt-in handoff fidelity guard. When True, an
+                                      # auto-generated compaction summary is checked
+                                      # against a continuity manifest built from the
+                                      # window being replaced (local structural gate,
+                                      # then a bounded semantic verification call on
+                                      # the existing auxiliary compression route). A
+                                      # rejected candidate is regenerated with the
+                                      # verifier's findings, up to
+                                      # `fidelity_max_retries` times; if nothing
+                                      # passes, the manifest itself is re-anchored as
+                                      # the summary rather than shipping a candidate
+                                      # known to drop context. Default False so an
+                                      # installation that has not opted in compresses
+                                      # exactly as before (no extra aux calls, no
+                                      # added compaction latency). Only the built-in
+                                      # compressor honours this — external context
+                                      # engines keep their own contract.
+        "fidelity_max_retries": 1,    # Regeneration budget for `fidelity_guard`
+                                      # (0-3, clamped; unparseable falls back to 1).
+                                      # 1 = generate, and on rejection generate once
+                                      # more with the verifier's findings. Each retry
+                                      # is another full summary call over an already
+                                      # oversized window, so the cap keeps one slow
+                                      # compaction from becoming a multi-minute stall.
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction

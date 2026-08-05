@@ -56,6 +56,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
+    COMPRESSION_FIDELITY_CONFIG_KEY,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
@@ -3478,6 +3479,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         model: str = None,
         model_config: Dict[str, Any] = None,
+        compression_fidelity_provenance: Dict[str, Any] = None,
         system_prompt: str = None,
         cwd: str = None,
         profile_name: str = None,
@@ -3489,7 +3491,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The parent closure, child row, and compacted handoff become visible in
         one transaction. Readers can therefore observe either the live parent or
         a complete child, never an ended parent with a missing/empty child.
+
+        ``compression_fidelity_provenance`` is an optional content-free audit
+        record (see ``ContextCompressor.get_last_fidelity_provenance``). It is
+        stamped onto the child's ``model_config`` under
+        ``COMPRESSION_FIDELITY_CONFIG_KEY`` via a shallow copy — the caller's
+        live config dict is never mutated — and is serialized by the child
+        INSERT below, so provenance commits or rolls back with the boundary.
         """
+        child_model_config = model_config
+        if isinstance(compression_fidelity_provenance, dict):
+            child_model_config = dict(model_config or {})
+            child_model_config[COMPRESSION_FIDELITY_CONFIG_KEY] = (
+                compression_fidelity_provenance
+            )
+
         def _do(conn):
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
@@ -3531,7 +3547,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     child_session_id,
                     source,
                     model,
-                    json.dumps(model_config) if model_config else None,
+                    json.dumps(child_model_config) if child_model_config else None,
                     system_prompt_hash,
                     parent_session_id,
                     cwd or parent["cwd"],

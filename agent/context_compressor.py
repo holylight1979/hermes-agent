@@ -23,6 +23,7 @@ import sqlite3
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -1288,6 +1289,437 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
 
 
+# ---------------------------------------------------------------------------
+# Continuity manifest
+#
+# A compaction summary is written by an LLM, so it can silently drop or invert
+# the few facts a session cannot continue without.  The manifest is the
+# deterministic counterweight: it is derived only from the exact messages in
+# the compression window, carries the window ordinal each fact came from, and
+# digests the normalized (already redacted) text so a later gate can prove a
+# candidate summary still carries the fact without re-reading the transcript.
+#
+# Everything here is pure: no message is mutated, no model is called.
+# ---------------------------------------------------------------------------
+
+CONTINUITY_KIND_USER_DIRECTIVE = "user_directive"
+CONTINUITY_KIND_PROHIBITION = "prohibition"
+CONTINUITY_KIND_APPROVAL = "approval"
+CONTINUITY_KIND_PENDING_TODO = "pending_todo"
+CONTINUITY_KIND_TOOL_FAILURE = "tool_failure"
+CONTINUITY_KIND_FILE_PATH = "file_path"
+CONTINUITY_KIND_TEST_EVIDENCE = "test_evidence"
+
+# Facts are anchors, not transcripts: enough text to recognise the fact in a
+# summary, short enough that a manifest over a large window stays cheap.
+_MANIFEST_TEXT_MAX_CHARS = 400
+_MANIFEST_MAX_FACTS_PER_KIND = 24
+
+_MANIFEST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;。！？；])\s+|\n+")
+
+# Cues are matched against user text only, so ordinary prose like "the test
+# failed" cannot manufacture a prohibition.
+_PROHIBITION_CUE_RE = re.compile(
+    r"\b(?:do not|don't|dont|never|must not|mustn't|cannot|can't|no longer|"
+    r"stop|avoid|refrain from|hold off)\b"
+    r"|不要|別|请勿|請勿|禁止|不准|不可以",
+    re.IGNORECASE,
+)
+_APPROVAL_CUE_RE = re.compile(
+    r"\b(?:approved?|go ahead|proceed|lgtm|ship it|sounds good|confirmed|"
+    r"green light)\b"
+    r"|同意|批准|核准",
+    re.IGNORECASE,
+)
+_TEST_COMMAND_RE = re.compile(
+    r"\b(?:pytest|py\.test|unittest|npm (?:run )?test|yarn test|jest|vitest|"
+    r"cargo test|go test|gradle test|mvn test|tox|run_verify)\b",
+    re.IGNORECASE,
+)
+_TEST_RESULT_RE = re.compile(
+    r"\b\d+\s+(?:passed|failed|errors?|skipped)\b",
+    re.IGNORECASE,
+)
+_TOOL_FAILURE_RE = re.compile(
+    r"\b(?:error|failed|failure|exception|traceback|timed out|timeout|fatal|"
+    r"not found|permission denied)\b",
+    re.IGNORECASE,
+)
+_TODO_PENDING_STATUSES = frozenset({"pending", "in_progress"})
+_MANIFEST_PATH_ARG_KEYS = frozenset({"path", "file_path", "workdir", "output_path"})
+
+# Manifest paths need their own matcher rather than ``_PATH_MENTION_RE``: that
+# one anchors on a leading separator, so a repo-relative mention inside prose
+# or a command ("pytest tests/agent/test_widget.py") is captured from its first
+# slash onwards and lands in the manifest as a truncated, unresolvable path.
+# A fact that is digested and later replayed has to be the whole path or
+# nothing, so match full segment chains and keep only file-shaped hits.
+_MANIFEST_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:\\|~[/\\]|[/\\])?(?:[\w.\-]+[/\\])+[\w.\-]+"
+)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_manifest_text(value: Any) -> str:
+    """Redact, collapse whitespace, and bound a fact's text.
+
+    Normalization is part of the contract: the digest is taken over this exact
+    form, so two runs over the same window always produce the same manifest.
+    """
+    text = _redact_compaction_text(_content_text_for_contains(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > _MANIFEST_TEXT_MAX_CHARS:
+        text = text[: _MANIFEST_TEXT_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+    return text
+
+
+def _manifest_sentences(text: str) -> list[str]:
+    """Split user text into sentence-ish chunks for cue classification."""
+    chunks = _MANIFEST_SENTENCE_SPLIT_RE.split(text or "")
+    return [re.sub(r"\s+", " ", chunk).strip() for chunk in chunks if chunk.strip()]
+
+
+def _manifest_path_mentions(text: str, paths: list[str]) -> None:
+    """Collect whole file-shaped paths mentioned in *text*."""
+    for match in _MANIFEST_PATH_RE.findall(text or ""):
+        candidate = match.rstrip(".,:;")
+        tail = re.split(r"[/\\]", candidate)[-1]
+        if "." not in tail:
+            # "and/or", "24/7", a bare directory chain — not a file reference.
+            continue
+        _dedupe_append(paths, candidate, limit=12)
+
+
+def _manifest_paths_from_tool_args(args: str) -> list[str]:
+    """Collect file paths a tool call named explicitly."""
+    paths: list[str] = []
+    try:
+        parsed = json.loads(args) if args else None
+    except Exception:
+        parsed = None
+
+    def _walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                if key in _MANIFEST_PATH_ARG_KEYS and isinstance(val, str) and val.strip():
+                    _dedupe_append(paths, val.strip(), limit=12)
+                _walk(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                _walk(val)
+        elif isinstance(obj, str):
+            _manifest_path_mentions(obj, paths)
+
+    if parsed is None:
+        _manifest_path_mentions(args or "", paths)
+    else:
+        _walk(parsed)
+    return paths
+
+
+def _manifest_pending_todos(args: str) -> list[str] | None:
+    """Return unfinished todo contents from a ``todo`` write, or None.
+
+    ``None`` means "this call was a read, not a write" so the caller keeps the
+    previous write's state; an empty list means the plan was explicitly
+    emptied.  Completed and cancelled items are dropped: re-surfacing them is
+    exactly how a compaction talks a session into redoing finished work.
+    """
+    try:
+        parsed = json.loads(args) if args else None
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    todos = parsed.get("todos")
+    if not isinstance(todos, list):
+        return None
+    pending: list[str] = []
+    for item in todos:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if content and status in _TODO_PENDING_STATUSES:
+            pending.append(content)
+    return pending
+
+
+def _manifest_command(tool_name: str, args: str) -> str:
+    """Best-effort human-readable identity of what a tool call ran."""
+    try:
+        parsed = json.loads(args) if args else {}
+    except Exception:
+        parsed = {}
+    if isinstance(parsed, dict):
+        for key in ("command", "cmd", "path", "file_path", "pattern"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return tool_name or "unknown"
+
+
+# Fidelity validation
+#
+# Failure codes are content-free by design: a verdict may travel into logs and
+# telemetry, so it carries codes plus the source ordinals to look at, never the
+# source text itself.
+
+FIDELITY_MISSING_SECTIONS = "missing_required_sections"
+FIDELITY_MISSING_LATEST_REQUEST = "missing_latest_user_request"
+FIDELITY_MISSING_PROHIBITION = "missing_prohibition"
+FIDELITY_REVERSED_PROHIBITION = "reversed_prohibition"
+FIDELITY_MISSING_PENDING_STATE = "missing_pending_state"
+FIDELITY_PENDING_STATE_DISTORTED = "pending_state_distorted"
+FIDELITY_FABRICATED_SUCCESS = "fabricated_success"
+FIDELITY_INVENTED_USER_ATTRIBUTION = "invented_user_attribution"
+
+# Both the LLM template and the deterministic fallback emit these, and the
+# fallback's size cap only ever truncates later sections — so a candidate
+# missing one of them is structurally broken, not merely terse.
+_REQUIRED_SUMMARY_SECTIONS = (
+    HISTORICAL_TASK_HEADING,
+    "## Goal",
+    "## Completed Actions",
+    "## Active State",
+)
+
+# How much of a directive must reappear verbatim. The grounded snapshot quotes
+# the user's exact words, so a prefix match is enough to tell "carried" from
+# "paraphrased away" without demanding the whole (possibly truncated) text.
+_FIDELITY_NEEDLE_CHARS = 200
+
+_FIDELITY_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./\\-]{2,}")
+_FIDELITY_STOPWORDS = frozenset({
+    "about", "after", "again", "also", "asked", "avoid", "because", "been",
+    "before", "being", "code", "context", "dont", "done", "each", "file",
+    "files", "from", "have", "into", "just", "make", "made", "more", "must",
+    "need", "needs", "never", "only", "over", "please", "should", "some",
+    "stop", "summary", "test", "tests", "than", "that", "their", "them",
+    "then", "there", "these", "they", "this", "user", "using", "very", "was",
+    "were", "what", "when", "which", "while", "will", "with", "work",
+    "working", "would", "your",
+})
+_FIDELITY_NEGATION_CUE_RE = re.compile(
+    r"\b(?:not|no|never|without|prohibit\w*|forbid\w*|forbidden|banned|"
+    r"disallow\w*|off-limits|must not|do not|don't|dont|avoid\w*|refrain|"
+    r"stop|blocked from)\b"
+    r"|不要|別|请勿|請勿|禁止|不准|不可以",
+    re.IGNORECASE,
+)
+_FIDELITY_COMPLETION_CUE_RE = re.compile(
+    r"\b(?:completed?|complete|done|finished|resolved|closed|shipped|landed|"
+    r"merged)\b|\[x\]|已完成|完成",
+    re.IGNORECASE,
+)
+_FIDELITY_PENDING_CUE_RE = re.compile(
+    r"\b(?:pending|in progress|in-progress|not yet|not started|unfinished|"
+    r"outstanding|remaining|remains|still|todo|to do|open|blocked|next)\b"
+    r"|\[ \]|\[>\]|待辦|待办|進行中|进行中|未完成",
+    re.IGNORECASE,
+)
+_FIDELITY_SUCCESS_CUE_RE = re.compile(
+    r"\b(?:passed|passing|succeeded|success|successful|green|all tests pass\w*|"
+    r"no failures|clean)\b|通過|成功",
+    re.IGNORECASE,
+)
+
+
+def _fidelity_anchor(text: str) -> str:
+    """Pick the single most distinctive token of a fact, lowercased.
+
+    One anchor rather than a bag of words: a path, module, or identifier is
+    what a summary must keep to be recognisably about the same fact, and
+    matching on one strong token keeps the check predictable instead of
+    threshold-tuned.
+    """
+    best = ""
+    for token in _FIDELITY_TOKEN_RE.findall(text or ""):
+        token = token.strip("./\\-").lower()
+        if len(token) < 4 or token.isdigit() or token in _FIDELITY_STOPWORDS:
+            continue
+        if len(token) > len(best):
+            best = token
+    return best
+
+
+# Semantic verification
+#
+# The local gate is string-level: it proves a manifest fact is still MENTIONED,
+# not that the summary still MEANS the same thing.  One bounded auxiliary call
+# closes that gap.  It rides the existing ``compression`` task route (same
+# provider resolution, same timeout floor, same interrupt protection) so it
+# introduces no credential, no environment variable, and no new provider path.
+#
+# Everything about it fails closed: a rejected verdict, a verdict that is not
+# strict JSON, and an unreachable verifier all mean "do not commit".
+
+FIDELITY_SEMANTIC_REJECTED = "semantic_verification_rejected"
+FIDELITY_SEMANTIC_MALFORMED = "semantic_verdict_malformed"
+FIDELITY_SEMANTIC_UNAVAILABLE = "semantic_verifier_unavailable"
+
+# Regeneration budget. 1 = generate, and on rejection generate once more with
+# the verifier's findings.
+_FIDELITY_MAX_RETRIES_DEFAULT = 1
+FIDELITY_MAX_RETRIES_CAP = 3
+
+# Verifier input bounds. The window is already summarized down, but a
+# pathological candidate (or a manifest over a huge window) must not turn the
+# verification call into a second oversized request.
+_FIDELITY_VERIFIER_PROMPT_MAX_CHARS = 60000
+_FIDELITY_VERIFIER_SUMMARY_MAX_CHARS = 24000
+_FIDELITY_VERIFIER_MAX_FACTS = 60
+_FIDELITY_VERIFIER_FACT_MAX_CHARS = 300
+
+# Provenance record exported after a guarded generation.
+#
+# The manifest itself is already capped per kind, but this record exists to be
+# logged/persisted next to the compression lineage, so it carries its own
+# bounds: a pathological window must not turn one audit line into an unbounded
+# payload.  Nothing here is source content — kinds, ordinals and digests only.
+FIDELITY_PROVENANCE_SCHEMA_VERSION = 1
+_FIDELITY_PROVENANCE_MAX_FACTS = 60
+_FIDELITY_PROVENANCE_MAX_CODES = 10
+_FIDELITY_PROVENANCE_MAX_ID_CHARS = 128
+
+# Findings fed back into the regeneration prompt.
+_FIDELITY_FINDINGS_HEADER = "FIDELITY REVIEW — FIX THESE BEFORE REWRITING:"
+_FIDELITY_FINDINGS_MAX_CHARS = 2000
+_FIDELITY_FINDINGS_MAX_ITEMS = 10
+
+# First line of the verifier prompt; also how tests and log readers recognise
+# the call.
+_FIDELITY_VERIFIER_PROMPT_HEADER = (
+    "You are a compaction fidelity verifier."
+)
+
+# A model that emits a whole-content ```json fence is a formatting artifact,
+# not a looser contract: unwrap that exact shape, and nothing else.
+_FIDELITY_JSON_FENCE_RE = re.compile(
+    r"\A```(?:json|JSON)?\s*\n(?P<body>.*?)\n?```\Z",
+    re.DOTALL,
+)
+
+
+def _fidelity_lines(body: str) -> list[str]:
+    """Normalized, lowercased non-empty lines of a summary body."""
+    lines = []
+    for line in (body or "").splitlines():
+        normalized = re.sub(r"\s+", " ", line).strip().lower()
+        if normalized:
+            lines.append(normalized)
+    return lines
+
+
+@dataclass(frozen=True)
+class ContinuityFact:
+    """One source-backed fact that must survive a compaction generation."""
+
+    kind: str
+    text: str
+    ordinal: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class ContinuityManifest:
+    """Ordered facts derived from one compression window."""
+
+    facts: tuple[ContinuityFact, ...]
+    source_count: int
+    digest: str
+
+    def of_kind(self, kind: str) -> tuple[ContinuityFact, ...]:
+        return tuple(fact for fact in self.facts if fact.kind == kind)
+
+    def latest_user_directive(self) -> Optional[ContinuityFact]:
+        directives = self.of_kind(CONTINUITY_KIND_USER_DIRECTIVE)
+        return directives[-1] if directives else None
+
+
+@dataclass(frozen=True)
+class SummaryFidelityVerdict:
+    """Content-free outcome of the local fidelity gate."""
+
+    accepted: bool
+    failure_codes: tuple[str, ...]
+    source_ordinals: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SemanticFidelityVerdict:
+    """Outcome of the bounded semantic verification call.
+
+    ``failure_codes`` and ``missing_source_ordinals`` are content-free and safe
+    to log.  ``contradictions`` is verifier-authored prose about the candidate:
+    it is bounded and redacted, but it exists only to be fed back into the
+    regeneration prompt — never into logs or telemetry.
+    """
+
+    accepted: bool
+    failure_codes: tuple[str, ...] = ()
+    missing_source_ordinals: tuple[int, ...] = ()
+    contradictions: tuple[str, ...] = ()
+
+
+def resolve_fidelity_settings(
+    compression_cfg: Optional[Dict[str, Any]],
+) -> tuple[bool, int]:
+    """Resolve ``compression.fidelity_guard`` / ``fidelity_max_retries``.
+
+    Follows the repository's ``config.yaml`` conventions: values may arrive as
+    real booleans/ints from YAML or as strings from ``hermes config set``, and
+    an unparseable value falls back to the default rather than erroring.  The
+    guard defaults to OFF so an installation that has not opted in behaves
+    exactly as before.
+
+    No environment variable and no credential participates in this resolution —
+    the verifier rides the auxiliary compression route that is already
+    configured.
+    """
+    cfg = compression_cfg if isinstance(compression_cfg, dict) else {}
+    return (
+        _coerce_fidelity_guard(cfg.get("fidelity_guard", False)),
+        _coerce_fidelity_max_retries(cfg.get("fidelity_max_retries", 1)),
+    )
+
+
+def _bounded_provenance_id(value: Any) -> str:
+    """Clip a session id to a loggable length; never raises on odd input."""
+    if value is None:
+        return ""
+    return str(value)[:_FIDELITY_PROVENANCE_MAX_ID_CHARS]
+
+
+def _coerce_fidelity_guard(raw: Any) -> bool:
+    """``config.yaml``-style truthiness (mirrors abort_on_summary_failure)."""
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _coerce_fidelity_max_retries(raw: Any) -> int:
+    """Bounded regeneration count; unparseable falls back to the default.
+
+    Capped because every retry is another full summary call on an already
+    oversized window: an unbounded budget turns one slow compaction into a
+    multi-minute stall.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return _FIDELITY_MAX_RETRIES_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _FIDELITY_MAX_RETRIES_DEFAULT
+    return max(0, min(value, FIDELITY_MAX_RETRIES_CAP))
+
+
 def resolve_model_threshold(
     model: str,
     model_thresholds: dict[str, float] | None,
@@ -1361,6 +1793,8 @@ class ContextCompressor(ContextEngine):
         self._last_compression_telemetry = None
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
+        self._last_fidelity_failure_codes = ()
+        self._last_fidelity_generations = 0
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -2224,6 +2658,8 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
+        fidelity_guard: Any = False,
+        fidelity_max_retries: Any = _FIDELITY_MAX_RETRIES_DEFAULT,
     ):
         self.model = model
         self.base_url = base_url
@@ -2293,6 +2729,26 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+
+        # Fidelity guard (compression.fidelity_guard / fidelity_max_retries).
+        # Values are coerced with the config.yaml conventions here as well as in
+        # resolve_fidelity_settings(), so a caller that forwards a raw config
+        # value gets the same behaviour as one that pre-resolved it. OFF by
+        # default: an installation that has not opted in must see byte-identical
+        # compaction output.
+        self.fidelity_guard = _coerce_fidelity_guard(fidelity_guard)
+        self.fidelity_max_retries = _coerce_fidelity_max_retries(fidelity_max_retries)
+        # Content-free record of the last guard outcome, for callers and
+        # telemetry. Never holds source or verifier prose.
+        self._last_fidelity_failure_codes: tuple[str, ...] = ()
+        self._last_fidelity_generations: int = 0
+        self._last_fidelity_accepted: bool = False
+        self._last_fidelity_reanchor_used: bool = False
+        # The exact manifest the last guarded generation validated against.
+        # Held (rather than rebuilt on demand) because a rebuild reads the
+        # window again and could disagree with what actually gated the commit —
+        # which is precisely what the provenance record must not do.
+        self._last_fidelity_manifest: Optional[ContinuityManifest] = None
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -3402,6 +3858,34 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
         return summary
 
+    def _build_fidelity_reanchor_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+    ) -> str:
+        """Build a verified local handoff after every model candidate is rejected."""
+        manifest = self._last_fidelity_manifest
+        digest = manifest.digest if manifest is not None else "unavailable"
+        source_count = manifest.source_count if manifest is not None else len(
+            turns_to_summarize
+        )
+        codes = ", ".join(self._last_fidelity_failure_codes) or "unknown"
+        summary = self._build_static_fallback_summary(
+            turns_to_summarize,
+            reason=f"fidelity validation rejected model output ({codes})",
+        )
+        body = self._strip_summary_prefix(summary)
+        body += (
+            "\n\n## Compression Fidelity Re-anchor\n"
+            "No model-authored candidate passed the fidelity gates. The rejected "
+            "candidate was not committed. This deterministic, source-backed "
+            "handoff continues the logical task while the complete parent "
+            "transcript remains the authority for exact recovery.\n"
+            f"- source_count: {source_count}\n"
+            f"- manifest_digest: {digest}\n"
+            f"- failure_codes: {codes}"
+        )
+        return self._with_summary_prefix(_redact_compaction_text(body))
+
     @classmethod
     def _bound_summary_input(cls, content: str) -> str:
         """Cap total summarizer input while preserving beginning and recent tail.
@@ -3471,6 +3955,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         memory_context: str = "",
+        fidelity_findings: str = "",
+        ground_task_snapshot: bool = True,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -3762,6 +4248,14 @@ Use this exact structure:
 FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
+        # Findings from a candidate the fidelity guard already rejected
+        # (``_generate_verified_summary``). Appended last so it overrides the
+        # template, and so everything above it stays a byte-identical prefix
+        # across regenerations — a rewrite must not invalidate the prompt cache
+        # for the part of the prompt that did not change.
+        if fidelity_findings:
+            prompt += f"\n\n{fidelity_findings}"
+
         try:
             call_kwargs = {
                 "task": "compression",
@@ -3867,7 +4361,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             # P2 ghost-skill defense (#32106): deterministically restore any
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
-            summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            if ground_task_snapshot:
+                summary = self._ground_historical_task_snapshot(
+                    summary, turns_to_summarize
+                )
             self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
             self._previous_summary = summary
@@ -3981,6 +4478,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    fidelity_findings=fidelity_findings,
+                    ground_task_snapshot=ground_task_snapshot,
                 )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
@@ -4002,6 +4501,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    fidelity_findings=fidelity_findings,
+                    ground_task_snapshot=ground_task_snapshot,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -4373,6 +4874,625 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             return grounded.strip()
         return f"{replacement}{body}".strip()
+
+    @classmethod
+    def _build_continuity_manifest(
+        cls,
+        messages: List[Dict[str, Any]],
+    ) -> ContinuityManifest:
+        """Derive the source-backed facts a compaction must not lose.
+
+        Reads the compression window only — the ordinals are indices into
+        *messages* as passed in, so a caller can point back at the exact rows
+        a fact came from.  Never mutates *messages*.
+
+        User-role scaffolding (todo re-injection, prior handoffs, truncation
+        notices, the continuation marker) is excluded through the same
+        real-user predicate the runtime uses for anchor restoration, so a
+        synthetic row can never be read as a current user directive.
+        """
+        from agent.conversation_compression import _is_real_user_message
+
+        facts: list[ContinuityFact] = []
+        seen: set[tuple[str, str]] = set()
+        per_kind: dict[str, int] = {}
+
+        def _add(kind: str, value: Any, ordinal: int) -> None:
+            text = _normalize_manifest_text(value)
+            if not text:
+                return
+            key = (kind, text.lower())
+            if key in seen:
+                return
+            if per_kind.get(kind, 0) >= _MANIFEST_MAX_FACTS_PER_KIND:
+                return
+            seen.add(key)
+            per_kind[kind] = per_kind.get(kind, 0) + 1
+            facts.append(
+                ContinuityFact(
+                    kind=kind,
+                    text=text,
+                    ordinal=ordinal,
+                    digest=_sha256_text(text),
+                )
+            )
+
+        call_sites: dict[str, tuple[str, str]] = {}
+        # Only the newest todo write describes the current plan; earlier ones
+        # are superseded snapshots.
+        pending_todos: tuple[int, list[str]] | None = None
+
+        for ordinal, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+
+            if role == "user":
+                if not _is_real_user_message(msg):
+                    continue
+                raw = _redact_compaction_text(
+                    _content_text_for_contains(msg.get("content"))
+                )
+                _add(CONTINUITY_KIND_USER_DIRECTIVE, raw, ordinal)
+                for sentence in _manifest_sentences(raw):
+                    if _PROHIBITION_CUE_RE.search(sentence):
+                        _add(CONTINUITY_KIND_PROHIBITION, sentence, ordinal)
+                    elif _APPROVAL_CUE_RE.search(sentence):
+                        _add(CONTINUITY_KIND_APPROVAL, sentence, ordinal)
+                for path in _manifest_paths_from_tool_args(raw):
+                    _add(CONTINUITY_KIND_FILE_PATH, path, ordinal)
+                continue
+
+            if role == "assistant":
+                for tool_call in msg.get("tool_calls") or []:
+                    name, raw_args = _extract_tool_call_name_and_args(tool_call)
+                    args = _redact_compaction_text(raw_args)
+                    call_id = _extract_tool_call_id(tool_call)
+                    if call_id:
+                        call_sites[call_id] = (name, args)
+                    if name == "todo":
+                        todos = _manifest_pending_todos(args)
+                        if todos is not None:
+                            pending_todos = (ordinal, todos)
+                    for path in _manifest_paths_from_tool_args(args):
+                        _add(CONTINUITY_KIND_FILE_PATH, path, ordinal)
+                continue
+
+            if role == "tool":
+                name, args = call_sites.get(
+                    str(msg.get("tool_call_id") or ""), ("unknown", "")
+                )
+                text = _redact_compaction_text(
+                    _content_text_for_contains(msg.get("content"))
+                )
+                command = _manifest_command(name, args)
+                if _TEST_COMMAND_RE.search(command) or _TEST_RESULT_RE.search(text):
+                    _add(
+                        CONTINUITY_KIND_TEST_EVIDENCE,
+                        f"{command} => {text}",
+                        ordinal,
+                    )
+                elif _TOOL_FAILURE_RE.search(text):
+                    _add(
+                        CONTINUITY_KIND_TOOL_FAILURE,
+                        f"{command} => {text}",
+                        ordinal,
+                    )
+
+        if pending_todos is not None:
+            todo_ordinal, todo_items = pending_todos
+            for item in todo_items:
+                _add(CONTINUITY_KIND_PENDING_TODO, item, todo_ordinal)
+
+        facts.sort(key=lambda fact: fact.ordinal)
+        payload = "\n".join(
+            f"{fact.ordinal}|{fact.kind}|{fact.digest}" for fact in facts
+        )
+        return ContinuityManifest(
+            facts=tuple(facts),
+            source_count=len(messages),
+            digest=_sha256_text(f"{len(messages)}\n{payload}"),
+        )
+
+    @classmethod
+    def _validate_summary_fidelity(
+        cls,
+        summary: str,
+        messages: List[Dict[str, Any]],
+        manifest: Optional[ContinuityManifest] = None,
+    ) -> SummaryFidelityVerdict:
+        """Check a candidate summary against the window's continuity manifest.
+
+        Deterministic and fail-closed: a candidate is accepted only when the
+        structural sections exist and every manifest anchor is still present
+        and still says the same thing.  A dropped latest request, a
+        prohibition that lost its negation, pending work described as
+        finished, or a failure rewritten as a success all reject.
+
+        The verdict is content-free — codes plus the source ordinals to look
+        at — so it can be logged without re-leaking compacted text.
+        """
+        body = cls._strip_summary_prefix(summary or "")
+        missing_sections = [
+            heading
+            for heading in _REQUIRED_SUMMARY_SECTIONS
+            if not re.search(rf"(?m)^{re.escape(heading)}\s*$", body)
+        ]
+        if missing_sections:
+            # Section extraction below is meaningless without the structure,
+            # so stop here rather than emitting derived noise.
+            return SummaryFidelityVerdict(
+                accepted=False,
+                failure_codes=(FIDELITY_MISSING_SECTIONS,),
+                source_ordinals=(),
+            )
+
+        if manifest is None:
+            manifest = cls._build_continuity_manifest(messages)
+
+        codes: list[str] = []
+        ordinals: set[int] = set()
+        lines = _fidelity_lines(body)
+
+        def _hits(fact: ContinuityFact) -> list[str] | None:
+            """Summary lines that talk about *fact*, or None if it has no anchor."""
+            anchor = _fidelity_anchor(fact.text)
+            if not anchor:
+                return None
+            return [line for line in lines if anchor in line]
+
+        latest = manifest.latest_user_directive()
+        if latest is not None:
+            # The task snapshot is where grounding puts the user's exact
+            # words, so that is where the latest request has to survive.
+            section_match = _HISTORICAL_TASK_SECTION_RE.search(body)
+            section = section_match.group(0) if section_match else ""
+            section = re.sub(r"\s+", " ", section).strip().lower()
+            needle = latest.text[:_FIDELITY_NEEDLE_CHARS].strip().lower()
+            if not needle or needle not in section:
+                codes.append(FIDELITY_MISSING_LATEST_REQUEST)
+                ordinals.add(latest.ordinal)
+        else:
+            # No real user turn in the window: reuse the existing provenance
+            # rule so a fabricated "User asked:" cannot ride in.
+            try:
+                cls._validate_summary_user_provenance(body, False)
+            except RuntimeError:
+                codes.append(FIDELITY_INVENTED_USER_ATTRIBUTION)
+
+        for fact in manifest.of_kind(CONTINUITY_KIND_PROHIBITION):
+            hits = _hits(fact)
+            if hits is None:
+                continue
+            if not hits:
+                codes.append(FIDELITY_MISSING_PROHIBITION)
+                ordinals.add(fact.ordinal)
+            elif not any(_FIDELITY_NEGATION_CUE_RE.search(line) for line in hits):
+                codes.append(FIDELITY_REVERSED_PROHIBITION)
+                ordinals.add(fact.ordinal)
+
+        for fact in manifest.of_kind(CONTINUITY_KIND_PENDING_TODO):
+            hits = _hits(fact)
+            if hits is None:
+                continue
+            if not hits:
+                codes.append(FIDELITY_MISSING_PENDING_STATE)
+                ordinals.add(fact.ordinal)
+                continue
+            says_done = any(_FIDELITY_COMPLETION_CUE_RE.search(line) for line in hits)
+            says_open = any(_FIDELITY_PENDING_CUE_RE.search(line) for line in hits)
+            if says_done and not says_open:
+                codes.append(FIDELITY_PENDING_STATE_DISTORTED)
+                ordinals.add(fact.ordinal)
+
+        for fact in (
+            manifest.of_kind(CONTINUITY_KIND_TEST_EVIDENCE)
+            + manifest.of_kind(CONTINUITY_KIND_TOOL_FAILURE)
+        ):
+            # Only a failure can be fabricated into a success; a passing run
+            # the summary leaves out is compression, not distortion.
+            if not _TOOL_FAILURE_RE.search(fact.text):
+                continue
+            hits = _hits(fact)
+            if not hits:
+                continue
+            claims_success = any(_FIDELITY_SUCCESS_CUE_RE.search(line) for line in hits)
+            keeps_failure = any(_TOOL_FAILURE_RE.search(line) for line in hits)
+            if claims_success and not keeps_failure:
+                codes.append(FIDELITY_FABRICATED_SUCCESS)
+                ordinals.add(fact.ordinal)
+
+        deduped = tuple(dict.fromkeys(codes))
+        return SummaryFidelityVerdict(
+            accepted=not deduped,
+            failure_codes=deduped,
+            source_ordinals=tuple(sorted(ordinals)),
+        )
+
+    @staticmethod
+    def _parse_semantic_verdict(raw: Any) -> SemanticFidelityVerdict:
+        """Parse one verifier response into a verdict, failing closed.
+
+        The contract is strict JSON: one object carrying exactly ``accepted``,
+        ``missing_source_ordinals`` and ``contradictions``, correctly typed.
+        Prose, a bare array, a missing or mistyped field, or JSON with a
+        preamble all mean the verifier is broken rather than lenient — the
+        candidate is rejected as malformed, because a parser that guesses at a
+        damaged verdict is exactly the failure this gate exists to catch.
+
+        A whole-content ```` ```json ```` fence is unwrapped first: that is a
+        formatting artifact of the wire, not a looser contract. A fence with
+        anything outside it is not.
+        """
+        malformed = SemanticFidelityVerdict(
+            accepted=False,
+            failure_codes=(FIDELITY_SEMANTIC_MALFORMED,),
+        )
+
+        text = raw.strip() if isinstance(raw, str) else ""
+        fence = _FIDELITY_JSON_FENCE_RE.match(text)
+        if fence:
+            text = fence.group("body").strip()
+        if not text:
+            return malformed
+
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return malformed
+        if not isinstance(payload, dict):
+            return malformed
+
+        accepted = payload.get("accepted")
+        ordinals = payload.get("missing_source_ordinals")
+        contradictions = payload.get("contradictions")
+        if not isinstance(accepted, bool):
+            return malformed
+        # ``bool`` is an ``int`` subclass, so exclude it explicitly rather than
+        # silently reading ``[true]`` as ordinal 1.
+        if not isinstance(ordinals, list) or not all(
+            isinstance(item, int) and not isinstance(item, bool) for item in ordinals
+        ):
+            return malformed
+        if not isinstance(contradictions, list) or not all(
+            isinstance(item, str) for item in contradictions
+        ):
+            return malformed
+
+        findings = tuple(
+            _redact_compaction_text(item).strip()[:_FIDELITY_FINDINGS_MAX_CHARS]
+            for item in contradictions[:_FIDELITY_FINDINGS_MAX_ITEMS]
+            if item.strip()
+        )
+        missing = tuple(dict.fromkeys(ordinals))[:_FIDELITY_VERIFIER_MAX_FACTS]
+
+        if accepted:
+            # A verdict that accepts while reporting findings contradicts
+            # itself; there is no safe way to honour half of it, so treat the
+            # verifier as broken rather than picking the permissive half.
+            if findings or missing:
+                return malformed
+            return SemanticFidelityVerdict(accepted=True)
+
+        return SemanticFidelityVerdict(
+            accepted=False,
+            failure_codes=(FIDELITY_SEMANTIC_REJECTED,),
+            missing_source_ordinals=missing,
+            contradictions=findings,
+        )
+
+    @classmethod
+    def _build_verifier_prompt(
+        cls,
+        summary: str,
+        manifest: ContinuityManifest,
+    ) -> str:
+        """Render the bounded, redacted verifier prompt for one candidate.
+
+        Instructions first, then the source facts, then the candidate — so the
+        final hard cap can only ever cut the candidate's tail, never the
+        contract the verdict has to satisfy.
+        """
+        rendered_facts = "\n".join(
+            f"{fact.ordinal} | {fact.kind} | "
+            f"{fact.text[:_FIDELITY_VERIFIER_FACT_MAX_CHARS]}"
+            for fact in manifest.facts[:_FIDELITY_VERIFIER_MAX_FACTS]
+        ) or "(none)"
+
+        candidate = _redact_compaction_text(cls._strip_summary_prefix(summary or ""))
+        if len(candidate) > _FIDELITY_VERIFIER_SUMMARY_MAX_CHARS:
+            candidate = (
+                candidate[:_FIDELITY_VERIFIER_SUMMARY_MAX_CHARS].rstrip()
+                + "\n...[candidate truncated for verification]..."
+            )
+
+        prompt = f"""{_FIDELITY_VERIFIER_PROMPT_HEADER}
+
+A window of conversation turns was compacted into the CANDIDATE SUMMARY below. The SOURCE FACTS were extracted from those same turns and are the ground truth. Judge only whether the candidate still MEANS what the source facts mean.
+
+REJECT when the candidate loses or distorts something that changes what happens next: a dropped instruction, a prohibition that lost its negation, pending work described as finished, a failure described as a success, or a claim attributed to the user that the user never made.
+ACCEPT otherwise. Brevity, rewording, and omitted detail that changes nothing are compaction working as intended, not infidelity.
+
+Reply with ONE JSON object and nothing else — no prose, no code fence:
+{{"accepted": true, "missing_source_ordinals": [], "contradictions": []}}
+
+"missing_source_ordinals" lists the ordinals of the SOURCE FACTS the candidate lost or distorted. "contradictions" states each problem in one sentence. Both must be empty when "accepted" is true.
+
+SOURCE FACTS (ordinal | kind | text):
+{rendered_facts}
+
+CANDIDATE SUMMARY:
+{candidate}"""
+
+        if len(prompt) > _FIDELITY_VERIFIER_PROMPT_MAX_CHARS:
+            prompt = prompt[:_FIDELITY_VERIFIER_PROMPT_MAX_CHARS]
+        return prompt
+
+    def _verify_summary_semantics(
+        self,
+        summary: str,
+        manifest: ContinuityManifest,
+    ) -> SemanticFidelityVerdict:
+        """Ask the bounded verifier whether a candidate still means the same.
+
+        Rides the existing ``compression`` auxiliary route: same provider and
+        model resolution, same interrupt protection, and no explicit timeout —
+        the compression task resolves and floors its own timeout inside
+        ``call_llm``, and an override here would bypass that floor. No new
+        credential and no environment variable participate.
+
+        Fails closed. A verifier that is unreachable, times out, or answers
+        with anything but a strict verdict rejects the candidate; only an
+        explicit accept lets it through.
+        """
+        prompt = self._build_verifier_prompt(summary, manifest)
+        call_kwargs: Dict[str, Any] = {
+            "task": "compression",
+            "main_runtime": {
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "api_key": self.api_key,
+                "api_mode": self.api_mode,
+            },
+            "messages": [{"role": "user", "content": prompt}],
+            # No max_tokens: a verdict is tiny, but a thinking model can burn
+            # an output cap on reasoning and return a truncated object that
+            # then reads as malformed.
+        }
+        if self.summary_model:
+            call_kwargs["model"] = self.summary_model
+
+        try:
+            with aux_interrupt_protection():
+                response = call_llm(**call_kwargs)
+        except Exception as e:
+            # Content-free: the exception text can quote the prompt.
+            logger.debug(
+                "Compaction fidelity verifier unavailable: %s", type(e).__name__
+            )
+            return SemanticFidelityVerdict(
+                accepted=False,
+                failure_codes=(FIDELITY_SEMANTIC_UNAVAILABLE,),
+            )
+
+        # Same defensive shape handling as the summary call: some
+        # OpenAI-compatible backends return a dict- or str-shaped message.
+        try:
+            message = response.choices[0].message
+        except Exception:
+            return SemanticFidelityVerdict(
+                accepted=False,
+                failure_codes=(FIDELITY_SEMANTIC_MALFORMED,),
+            )
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", message)
+        if not isinstance(content, str):
+            content = str(content) if content else ""
+
+        return self._parse_semantic_verdict(content)
+
+    @staticmethod
+    def _render_fidelity_findings(
+        failure_codes: tuple[str, ...],
+        source_ordinals: tuple[int, ...],
+        contradictions: tuple[str, ...],
+    ) -> str:
+        """Render one rejected candidate's findings for the rewrite prompt.
+
+        Bounded: at most ``_FIDELITY_FINDINGS_MAX_ITEMS`` contradictions and
+        ``_FIDELITY_FINDINGS_MAX_CHARS`` of prose (each item was already
+        redacted and clipped by ``_parse_semantic_verdict``).  Returns "" when
+        there is nothing to report, so a first generation carries no findings
+        block at all.
+
+        This is the one place verifier prose is allowed to travel: into the
+        next summarizer prompt.  Failure codes and ordinals are content-free
+        and may also be logged; the contradictions must not be.
+        """
+        lines: list[str] = []
+        if contradictions:
+            lines.append("Problems found in the previous candidate:")
+            lines.extend(
+                f"- {item}" for item in contradictions[:_FIDELITY_FINDINGS_MAX_ITEMS]
+            )
+        if failure_codes:
+            lines.append(f"Checks that rejected it: {', '.join(failure_codes)}")
+        if source_ordinals:
+            lines.append(
+                "Source turns it lost or distorted (ordinals): "
+                + ", ".join(str(ordinal) for ordinal in source_ordinals)
+            )
+        if not lines:
+            return ""
+        body = "\n".join(lines)[:_FIDELITY_FINDINGS_MAX_CHARS]
+        return (
+            f"{_FIDELITY_FINDINGS_HEADER}\n{body}\n"
+            "The previous candidate was NOT committed. Rewrite the summary "
+            "from the turns above, fixing every point listed here and keeping "
+            "the required structure. Quote the user's most recent unfulfilled "
+            "input verbatim, keep every prohibition negated, describe pending "
+            "work as pending, and describe failures as failures."
+        )
+
+    def _generate_verified_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+        memory_context: str = "",
+    ) -> Optional[str]:
+        """Generate a summary no gate rejects, or None.
+
+        Wraps ``_generate_summary`` with the two fidelity gates: the
+        deterministic local check, then — only for a candidate the local check
+        accepts — the bounded semantic verifier.  A rejected candidate buys a
+        regeneration fed the rejecting gate's findings, up to
+        ``fidelity_max_retries`` rewrites.
+
+        Fails closed in every direction.  An exhausted budget returns None; so
+        does a malformed verdict or an unreachable verifier, and those two
+        return *without* regenerating — the candidate was never judged, so
+        rewriting it cannot produce a verdict, and burning the budget on a
+        broken verifier only delays the same outcome.  A generation that fails
+        outright is handled by ``_generate_summary``'s own retry ladder and
+        never reaches the verifier.
+
+        With the guard off (the default) this is a straight delegation: one
+        summary call, no verifier call, byte-identical output.
+        """
+        self._last_fidelity_failure_codes = ()
+        self._last_fidelity_generations = 0
+        self._last_fidelity_accepted = False
+        self._last_fidelity_reanchor_used = False
+        self._last_fidelity_manifest = None
+
+        if not getattr(self, "fidelity_guard", False):
+            self._last_fidelity_generations = 1
+            return self._generate_summary(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+                memory_context=memory_context,
+            )
+
+        manifest = self._build_continuity_manifest(turns_to_summarize)
+        self._last_fidelity_manifest = manifest
+        findings = ""
+
+        # retries=0 still generates once; each retry is one more full summary
+        # call on an already oversized window, which is why the count is capped.
+        for attempt in range(self.fidelity_max_retries + 1):
+            # ``_generate_summary`` commits its candidate to
+            # ``_previous_summary`` for the next compaction's iterative update.
+            # A rejected candidate must not survive there — neither as this
+            # rewrite's base nor as the next compaction's — so snapshot the
+            # value and restore it whenever the candidate is refused.
+            previous_summary_before_attempt = self._previous_summary
+            self._last_fidelity_generations = attempt + 1
+            candidate = self._generate_summary(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+                memory_context=memory_context,
+                fidelity_findings=findings,
+                ground_task_snapshot=False,
+            )
+            if not candidate:
+                # A failed generation is not a fidelity verdict.  Restore the
+                # pre-attempt iterative base; the explicit auth/network gate in
+                # compress() owns whether stale earlier verdict codes may cause
+                # a re-anchor.  Keep the codes for diagnostics and telemetry.
+                self._previous_summary = previous_summary_before_attempt
+                return None
+
+            # A candidate must supply the task section itself; silently adding
+            # a wholly omitted section would hide a local fidelity failure.
+            # When the section exists, however, replace its model-authored
+            # contents with the deterministic source snapshot before checking
+            # it.  This corrects stale/protected-tail attribution without
+            # manufacturing a section the summarizer dropped.
+            candidate_for_validation = candidate
+            candidate_body = self._strip_summary_prefix(candidate)
+            if _HISTORICAL_TASK_SECTION_RE.search(candidate_body):
+                grounded_body = self._ground_historical_task_snapshot(
+                    candidate_body, turns_to_summarize
+                )
+                candidate_for_validation = self._with_summary_prefix(grounded_body)
+
+            local = self._validate_summary_fidelity(
+                candidate_for_validation, turns_to_summarize, manifest
+            )
+            if not local.accepted:
+                # No verifier call: the local gate is deterministic and already
+                # knows this candidate is broken.
+                self._previous_summary = previous_summary_before_attempt
+                self._last_fidelity_failure_codes = local.failure_codes
+                findings = self._render_fidelity_findings(
+                    local.failure_codes, local.source_ordinals, ()
+                )
+                continue
+
+            semantic = self._verify_summary_semantics(
+                candidate_for_validation, manifest
+            )
+            if semantic.accepted:
+                self._previous_summary = self._strip_summary_prefix(
+                    candidate_for_validation
+                )
+                self._last_fidelity_accepted = True
+                return candidate_for_validation
+
+            self._previous_summary = previous_summary_before_attempt
+            self._last_fidelity_failure_codes = semantic.failure_codes
+            if FIDELITY_SEMANTIC_REJECTED not in semantic.failure_codes:
+                return None
+            findings = self._render_fidelity_findings(
+                semantic.failure_codes,
+                semantic.missing_source_ordinals,
+                semantic.contradictions,
+            )
+
+        if not self.quiet_mode:
+            logger.warning(
+                "Compaction fidelity guard rejected every candidate after %d "
+                "generation(s): %s. No summary will be committed.",
+                self._last_fidelity_generations,
+                ", ".join(self._last_fidelity_failure_codes) or "unknown",
+            )
+        return None
+
+    def get_last_fidelity_provenance(
+        self,
+        parent_session_id: Any,
+        child_session_id: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a bounded, content-free audit record for the last guard run."""
+        manifest = self._last_fidelity_manifest
+        if not getattr(self, "fidelity_guard", False) or manifest is None:
+            return None
+        facts = [
+            {
+                "kind": fact.kind,
+                "ordinal": fact.ordinal,
+                "digest": fact.digest,
+            }
+            for fact in manifest.facts[:_FIDELITY_PROVENANCE_MAX_FACTS]
+        ]
+        return {
+            "schema_version": FIDELITY_PROVENANCE_SCHEMA_VERSION,
+            "parent_session_id": _bounded_provenance_id(parent_session_id),
+            "child_session_id": _bounded_provenance_id(child_session_id),
+            "accepted": bool(self._last_fidelity_accepted),
+            "reanchor_used": bool(self._last_fidelity_reanchor_used),
+            "failure_codes": list(
+                self._last_fidelity_failure_codes[:_FIDELITY_PROVENANCE_MAX_CODES]
+            ),
+            "generation_count": max(0, int(self._last_fidelity_generations)),
+            "source_count": max(0, int(manifest.source_count)),
+            "manifest_digest": manifest.digest,
+            "facts": facts,
+            "facts_truncated": len(manifest.facts) > len(facts),
+        }
 
     @classmethod
     def _find_context_summaries(
@@ -5985,6 +7105,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         self._last_compression_made_progress = False
+        self._last_fidelity_failure_codes = ()
+        self._last_fidelity_generations = 0
+        self._last_fidelity_accepted = False
+        self._last_fidelity_reanchor_used = False
+        self._last_fidelity_manifest = None
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
@@ -6318,7 +7443,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # for it when a summary will actually be generated.
             summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
             try:
-                summary = self._generate_summary(
+                summary = self._generate_verified_summary(
                     turns_to_summarize,
                     focus_topic=summary_focus_topic,
                     memory_context=memory_context,
@@ -6330,6 +7455,32 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._previous_summary = _previous_summary_before_scan
                 self._summary_has_user_turn = _summary_has_user_turn_before_scan
                 raise
+
+        # Fidelity rejection differs from provider failure: the complete source
+        # is available and the deterministic manifest was built, but no
+        # model-authored candidate was safe to commit. Continue through a local,
+        # redacted re-anchor so long work can proceed without weakening the
+        # provider/auth/network abort contract below.
+        #
+        # The auth/network flags are checked here as well as in the abort branch
+        # below: a retry cycle can reject one candidate on fidelity and then hit
+        # a terminal access or network failure on the rewrite. That run must
+        # abort unchanged — the last word belongs to the failure class that can
+        # never be repaired by re-anchoring, not to the earlier verdict.
+        if (
+            not summary
+            and not feasibility_skip
+            and not self._last_summary_auth_failure
+            and not self._last_summary_network_failure
+            and self._last_fidelity_manifest is not None
+            and self._last_fidelity_failure_codes
+        ):
+            summary = self._build_fidelity_reanchor_summary(turns_to_summarize)
+            self._last_fidelity_reanchor_used = True
+            self._last_summary_fallback_used = True
+            self._last_summary_dropped_count = compress_end - compress_start
+            telemetry["fallback_used"] = True
+            telemetry["failure_class"] = "fidelity_reanchor"
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):

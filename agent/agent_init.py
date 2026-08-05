@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, resolve_fidelity_settings
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -1989,6 +1989,13 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    # Handoff fidelity guard: OFF by default, so an installation that has not
+    # opted in compresses exactly as before.  Only the built-in compressor
+    # honours these; external context engines keep their own contract.
+    (
+        compression_fidelity_guard,
+        compression_fidelity_max_retries,
+    ) = resolve_fidelity_settings(_compression_cfg)
     # Per-model threshold overrides: keys are substring-matched against the
     # model name (longest match wins). Empty dict = use the global threshold
     # for all models (backward compatible).
@@ -2495,6 +2502,8 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            fidelity_guard=compression_fidelity_guard,
+            fidelity_max_retries=compression_fidelity_max_retries,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

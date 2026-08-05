@@ -11,6 +11,11 @@ description: >
   when the token has expired or is absent. Slow LLM responses surface a
   Template Buttons postback bubble so the user can fetch the answer with
   a fresh reply token (free) once it's ready.
+  Group/room mention gating is configured canonically with
+  gateway.platforms.line.extra.require_mention; existing deployments may
+  continue using LINE_REQUIRE_MENTION as a compatibility fallback. Replies
+  to messages sent by this bot are treated like native mentions; outbound
+  LINE message IDs are persisted so this survives Gateway restarts.
 author: Hermes Agent contributors
 # ``requires_env`` and ``optional_env`` entries are surfaced in the
 # ``hermes config`` UI via the platform-plugin env var injector in

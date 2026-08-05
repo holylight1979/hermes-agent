@@ -123,6 +123,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
 )
 from gateway.config import Platform
+from gateway import rich_sent_store
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +512,9 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    async def reply(
+        self, reply_token: str, messages: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -523,8 +526,15 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json()
+                    return data if isinstance(data, dict) else {}
+                except Exception:
+                    return {}
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def push(
+        self, chat_id: str, messages: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -536,6 +546,11 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                try:
+                    data = await resp.json()
+                    return data if isinstance(data, dict) else {}
+                except Exception:
+                    return {}
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -590,6 +605,49 @@ def _text_message(text: str) -> Dict[str, Any]:
     if len(text) > LINE_PER_BUBBLE_CHARS:
         text = text[: LINE_PER_BUBBLE_CHARS - 1] + "…"
     return {"type": "text", "text": text}
+
+
+def _record_sent_messages(
+    chat_id: str,
+    response: Any,
+    messages: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Persist LINE outbound IDs and return the first one, best-effort.
+
+    Reply and Push responses expose ``sentMessages[].id``. Keeping those IDs
+    in the existing profile-scoped rich-message index lets quote relevance
+    survive Gateway restarts without a LINE-specific state file.
+    """
+    if not isinstance(response, dict):
+        return None
+    sent = response.get("sentMessages") or []
+    if not isinstance(sent, list):
+        return None
+    first_id: Optional[str] = None
+    for index, item in enumerate(sent):
+        if not isinstance(item, dict):
+            continue
+        message_id = str(item.get("id") or "").strip()
+        if not message_id:
+            continue
+        if first_id is None:
+            first_id = message_id
+        message = messages[index] if index < len(messages) else {}
+        text = str(message.get("text") or message.get("altText") or "").strip()
+        if not text:
+            text = f"[LINE {message.get('type') or 'message'}]"
+        try:
+            rich_sent_store.record(chat_id, message_id, text)
+        except Exception as exc:
+            # LINE has already accepted the message. Index persistence is
+            # auxiliary and must never turn a successful send into a retry or
+            # a reported failure (which could duplicate the user's message).
+            logger.warning(
+                "LINE: unable to persist outbound message ID %s: %s",
+                message_id,
+                exc,
+            )
+    return first_id
 
 
 def _image_message(original_url: str, preview_url: Optional[str] = None) -> Dict[str, Any]:
@@ -684,6 +742,69 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _coerce_bool(value: Any) -> Optional[bool]:
+    """Parse a config boolean, returning ``None`` for absent/invalid values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _message_mentions_bot(message: Dict[str, Any], bot_user_id: Optional[str]) -> bool:
+    """Return whether LINE's native mention metadata targets this bot."""
+    if not isinstance(message, dict):
+        return False
+    mention = (message or {}).get("mention") or {}
+    if not isinstance(mention, dict):
+        return False
+    mentionees = mention.get("mentionees") or []
+    if not isinstance(mentionees, list):
+        return False
+    for mentionee in mentionees:
+        if not isinstance(mentionee, dict):
+            continue
+        if mentionee.get("isSelf") is True:
+            return True
+        if bot_user_id and mentionee.get("userId") == bot_user_id:
+            return True
+    return False
+
+
+def _reply_to_bot_text(
+    message: Dict[str, Any], chat_id: str
+) -> Optional[str]:
+    """Return persisted bot text for a LINE quote, failing closed safely.
+
+    LINE only supplies ``quotedMessageId`` for an inbound quote; it does not
+    include the quoted author's identity. Outbound message IDs are therefore
+    persisted in ``rich_sent_store`` and looked up here. Unknown IDs (for
+    example, replies between human group members) remain ignored.
+    """
+    if not isinstance(message, dict) or not chat_id:
+        return None
+    quoted_id = str(message.get("quotedMessageId") or "").strip()
+    if not quoted_id:
+        return None
+    try:
+        return rich_sent_store.lookup(chat_id, quoted_id)
+    except Exception as exc:
+        # A damaged or temporarily unavailable optional index must not break
+        # webhook delivery, especially when a native @mention is also present.
+        logger.warning("LINE: unable to read outbound message index: %s", exc)
+        return None
+
+
+def _message_replies_to_bot(message: Dict[str, Any], chat_id: str) -> bool:
+    """Return whether LINE's quote points at a message sent by this adapter."""
+    return _reply_to_bot_text(message, chat_id) is not None
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -727,8 +848,8 @@ class LineAdapter(BasePlatformAdapter):
         # Public base URL — required for media sending when bind isn't
         # publicly reachable.
         self.public_base_url = (
-            os.getenv("LINE_PUBLIC_URL")
-            or extra.get("public_url", "")
+            extra.get("public_url", "")
+            or os.getenv("LINE_PUBLIC_URL")
             or ""
         ).rstrip("/")
 
@@ -736,15 +857,35 @@ class LineAdapter(BasePlatformAdapter):
         self.allow_all = _truthy_env(
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
-        self.allowed_users = _csv_set(
-            os.getenv("LINE_ALLOWED_USERS", "")
-        ) | set(extra.get("allowed_users", []))
-        self.allowed_groups = _csv_set(
-            os.getenv("LINE_ALLOWED_GROUPS", "")
-        ) | set(extra.get("allowed_groups", []))
-        self.allowed_rooms = _csv_set(
-            os.getenv("LINE_ALLOWED_ROOMS", "")
-        ) | set(extra.get("allowed_rooms", []))
+        self.allowed_users = (
+            set(extra.get("allowed_users", []))
+            if "allowed_users" in extra
+            else _csv_set(os.getenv("LINE_ALLOWED_USERS", ""))
+        )
+        self.allowed_groups = (
+            set(extra.get("allowed_groups", []))
+            if "allowed_groups" in extra
+            else _csv_set(os.getenv("LINE_ALLOWED_GROUPS", ""))
+        )
+        self.allowed_rooms = (
+            set(extra.get("allowed_rooms", []))
+            if "allowed_rooms" in extra
+            else _csv_set(os.getenv("LINE_ALLOWED_ROOMS", ""))
+        )
+
+        # In groups/rooms, optionally require LINE's native @mention metadata.
+        # Canonical config wins; the env var remains a compatibility fallback.
+        parsed_require_mention = _coerce_bool(extra.get("require_mention"))
+        if parsed_require_mention is None:
+            if "require_mention" in extra and extra.get("require_mention") is not None:
+                logger.warning(
+                    "LINE: invalid require_mention value %r; falling back to "
+                    "LINE_REQUIRE_MENTION/default",
+                    extra.get("require_mention"),
+                )
+            self.require_mention = _truthy_env("LINE_REQUIRE_MENTION", False)
+        else:
+            self.require_mention = parsed_require_mention
 
         # Slow-LLM postback button threshold
         try:
@@ -1008,6 +1149,38 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        quoted_message_id = str(msg.get("quotedMessageId") or "").strip()
+        reply_to_text = _reply_to_bot_text(msg, chat_id)
+        replies_to_bot = reply_to_text is not None
+        mentions_bot = _message_mentions_bot(msg, self._bot_user_id)
+
+        # Apply the noise gate before storing a reply token or downloading
+        # media. DMs remain unaffected because LINE has no meaningful bot
+        # mention gate in 1:1 chats. A reply to one of this bot's persisted
+        # outbound message IDs is equivalent to a native @mention.
+        if (
+            self.require_mention
+            and chat_type in {"group", "room"}
+            and not mentions_bot
+            and not replies_to_bot
+        ):
+            logger.info(
+                "LINE: ignoring unmentioned %s message in %s "
+                "(quote_present=%s quote_matched=%s)",
+                msg_type or "unknown",
+                chat_id,
+                bool(quoted_message_id),
+                replies_to_bot,
+            )
+            return
+
+        if replies_to_bot and not mentions_bot:
+            logger.info(
+                "LINE: accepting unmentioned %s message in %s because its "
+                "quote matched a persisted bot message",
+                msg_type or "unknown",
+                chat_id,
+            )
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
@@ -1064,6 +1237,13 @@ class LineAdapter(BasePlatformAdapter):
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
+            reply_to_message_id=(
+                quoted_message_id
+                if replies_to_bot and quoted_message_id
+                else None
+            ),
+            reply_to_text=reply_to_text,
+            reply_to_is_own_message=replies_to_bot,
         )
 
         await self.handle_message(event_obj)
@@ -1212,15 +1392,21 @@ class LineAdapter(BasePlatformAdapter):
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, messages)
-                return SendResult(success=True, message_id=token)
+                response = await self._client.reply(token, messages)
+                sent_id = _record_sent_messages(chat_id, response, messages)
+                # Prefer the real outbound ID; the single-use reply token
+                # remains the fallback for API responses without sentMessages.
+                return SendResult(success=True, message_id=sent_id or token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
 
         try:
-            await self._client.push(chat_id, messages)
-            return SendResult(success=True, message_id=None)
+            response = await self._client.push(chat_id, messages)
+            return SendResult(
+                success=True,
+                message_id=_record_sent_messages(chat_id, response, messages),
+            )
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
             return SendResult(success=False, error=str(exc))
@@ -1536,20 +1722,25 @@ class LineAdapter(BasePlatformAdapter):
         first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
         rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
 
+        first_id: Optional[str] = None
+
         # First batch: try reply token, fall back to push.
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
+                response = await self._client.reply(token, first_batch)
+                first_id = _record_sent_messages(chat_id, response, first_batch)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    response = await self._client.push(chat_id, first_batch)
+                    first_id = _record_sent_messages(chat_id, response, first_batch)
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                response = await self._client.push(chat_id, first_batch)
+                first_id = _record_sent_messages(chat_id, response, first_batch)
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
 
@@ -1558,12 +1749,13 @@ class LineAdapter(BasePlatformAdapter):
             batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
             rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
             try:
-                await self._client.push(chat_id, batch)
+                response = await self._client.push(chat_id, batch)
+                first_id = first_id or _record_sent_messages(chat_id, response, batch)
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
 
-        return SendResult(success=True, message_id=None)
+        return SendResult(success=True, message_id=first_id)
 
 
 def _is_relative_to(child: Path, parent: Path) -> bool:
@@ -1675,8 +1867,11 @@ async def _standalone_send(
 
     client = _LineClient(token)
     try:
-        await client.push(chat_id, messages)
-        return {"success": True, "message_id": None}
+        response = await client.push(chat_id, messages)
+        return {
+            "success": True,
+            "message_id": _record_sent_messages(chat_id, response, messages),
+        }
     except Exception as exc:
         return {"error": str(exc)}
 

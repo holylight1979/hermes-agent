@@ -36,6 +36,9 @@ split_for_line = _line.split_for_line
 build_postback_button_message = _line.build_postback_button_message
 _resolve_chat = _line._resolve_chat
 _allowed_for_source = _line._allowed_for_source
+_message_mentions_bot = _line._message_mentions_bot
+_message_replies_to_bot = _line._message_replies_to_bot
+_record_sent_messages = _line._record_sent_messages
 _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
 State = _line.State
@@ -183,6 +186,7 @@ class TestInboundMedia:
         cfg = PlatformConfig(enabled=True, extra={
             "channel_access_token": "tok",
             "channel_secret": "sec",
+            "require_mention": False,
         })
         ad = LineAdapter(cfg)
         ad._client = MagicMock()
@@ -264,6 +268,87 @@ class TestSendRouting:
         assert "**" not in out
         assert "https://x.com" in out
 
+    def test_send_records_line_message_id_for_future_quote_detection(
+        self, adapter, monkeypatch
+    ):
+        import time as _time
+        adapter._reply_tokens["Cchat"] = ("rt-token", _time.time() + 30)
+        adapter._client.reply.return_value = {
+            "sentMessages": [{"id": "line-out-1", "quoteToken": "qt"}]
+        }
+        record = MagicMock()
+        monkeypatch.setattr(_line.rich_sent_store, "record", record)
+
+        result = asyncio.run(adapter.send("Cchat", "Hermes answer"))
+
+        assert result.success
+        assert result.message_id == "line-out-1"
+        record.assert_called_once_with("Cchat", "line-out-1", "Hermes answer")
+
+    def test_reply_success_is_not_retried_when_index_write_fails(
+        self, adapter, monkeypatch
+    ):
+        import time as _time
+        adapter._reply_tokens["Cchat"] = ("rt-token", _time.time() + 30)
+        adapter._client.reply.return_value = {
+            "sentMessages": [{"id": "line-out-1"}]
+        }
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "record",
+            MagicMock(side_effect=OSError("index unavailable")),
+        )
+
+        result = asyncio.run(adapter.send("Cchat", "Hermes answer"))
+
+        assert result.success
+        adapter._client.reply.assert_awaited_once()
+        adapter._client.push.assert_not_awaited()
+
+    def test_push_success_stays_success_when_index_write_fails(
+        self, adapter, monkeypatch
+    ):
+        adapter._client.push.return_value = {
+            "sentMessages": [{"id": "line-out-1"}]
+        }
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "record",
+            MagicMock(side_effect=OSError("index unavailable")),
+        )
+
+        result = asyncio.run(adapter.send("Cchat", "Hermes answer"))
+
+        assert result.success
+        adapter._client.push.assert_awaited_once()
+
+    def test_postback_reply_success_is_not_pushed_when_index_write_fails(
+        self, adapter, monkeypatch
+    ):
+        rid = adapter._cache.register_pending("Cchat")
+        adapter._cache.set_ready(rid, "cached answer")
+        adapter._client.reply.return_value = {
+            "sentMessages": [{"id": "line-out-1"}]
+        }
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "record",
+            MagicMock(side_effect=OSError("index unavailable")),
+        )
+        event = {
+            "replyToken": "postback-token",
+            "source": {"type": "group", "groupId": "Cchat"},
+            "postback": {
+                "data": json.dumps({"action": "show_response", "request_id": rid})
+            },
+        }
+
+        asyncio.run(adapter._handle_postback_event(event))
+
+        adapter._client.reply.assert_awaited_once()
+        adapter._client.push.assert_not_awaited()
+        assert adapter._cache.get(rid).state is State.DELIVERED
+
 
 # ---------------------------------------------------------------------------
 # 9. Register() metadata + plugin entry points
@@ -323,6 +408,42 @@ class TestStandaloneSend:
         result = asyncio.run(_standalone_send(cfg, "Uchat", "hi"))
         assert "error" in result
 
+    def test_push_records_outbound_id_and_returns_it(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        from gateway.config import PlatformConfig
+
+        push_calls = []
+
+        class _FakeClient:
+            def __init__(self, token, **kwargs):
+                pass
+
+            async def push(self, chat_id, messages):
+                push_calls.append((chat_id, messages))
+                return {
+                    "sentMessages": [
+                        {"id": "standalone-line-out-1", "quoteToken": "qt"}
+                    ]
+                }
+
+        monkeypatch.setattr(_line, "_LineClient", _FakeClient)
+        record = MagicMock()
+        monkeypatch.setattr(_line.rich_sent_store, "record", record)
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"channel_access_token": "tok"},
+        )
+        result = asyncio.run(_standalone_send(cfg, "Uchat", "hello"))
+        assert result.get("success") is True
+        assert result.get("message_id") == "standalone-line-out-1"
+        assert len(push_calls) == 1
+        assert push_calls[0][0] == "Uchat"
+        record.assert_called_once_with(
+            "Uchat", "standalone-line-out-1", "hello"
+        )
+        # Message wraps as text bubble
+        assert push_calls[0][1][0]["type"] == "text"
+
 
 class TestPostbackButtonShape:
 
@@ -380,6 +501,208 @@ class TestAdapterInit:
         assert ad.webhook_port == 7777
         assert ad.public_base_url == "https://x.example.com"
         assert ad.allowed_users == {"U1", "U2"}
+
+    def test_require_mention_prefers_config_extra(self, monkeypatch):
+        monkeypatch.setenv("LINE_REQUIRE_MENTION", "false")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={"require_mention": True}))
+        assert ad.require_mention is True
+
+    def test_require_mention_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("LINE_REQUIRE_MENTION", "true")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={}))
+        assert ad.require_mention is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "off", "no"])
+    def test_require_mention_false_strings_stay_false(self, monkeypatch, value):
+        monkeypatch.setenv("LINE_REQUIRE_MENTION", "true")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={"require_mention": value}))
+        assert ad.require_mention is False
+
+    def test_invalid_require_mention_falls_back_to_env(self, monkeypatch, caplog):
+        monkeypatch.setenv("LINE_REQUIRE_MENTION", "true")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={"require_mention": "maybe"}))
+        assert ad.require_mention is True
+        assert "invalid require_mention" in caplog.text
+
+    def test_require_mention_defaults_false(self, monkeypatch):
+        monkeypatch.delenv("LINE_REQUIRE_MENTION", raising=False)
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={}))
+        assert ad.require_mention is False
+
+
+class TestRequireMention:
+
+    @staticmethod
+    def _event(source_type="group", message=None):
+        source_id = "groupId" if source_type == "group" else "roomId"
+        return {
+            "type": "message",
+            "replyToken": "reply-token",
+            "source": {
+                "type": source_type,
+                source_id: "Cline" if source_type == "group" else "Rline",
+                "userId": "Uuser",
+            },
+            "message": message or {"type": "text", "id": "m1", "text": "hello"},
+        }
+
+    @staticmethod
+    def _adapter(monkeypatch, *, require_mention=True):
+        monkeypatch.delenv("LINE_REQUIRE_MENTION", raising=False)
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True, extra={"require_mention": require_mention}))
+        ad._bot_user_id = "Ubot"
+        ad.handle_message = AsyncMock()
+        return ad
+
+    def test_native_mention_predicate_accepts_is_self(self):
+        msg = {"mention": {"mentionees": [{"type": "user", "isSelf": True}]}}
+        assert _message_mentions_bot(msg, "Ubot")
+
+    def test_native_mention_predicate_accepts_bot_user_id(self):
+        msg = {"mention": {"mentionees": [{"type": "user", "userId": "Ubot"}]}}
+        assert _message_mentions_bot(msg, "Ubot")
+
+    def test_native_mention_predicate_rejects_other_user(self):
+        msg = {"mention": {"mentionees": [
+            {"type": "user", "userId": "Uother", "isSelf": False}
+        ]}}
+        assert not _message_mentions_bot(msg, "Ubot")
+
+    @pytest.mark.parametrize("message", [
+        {"mention": "invalid"},
+        {"mention": {"mentionees": {"userId": "Ubot"}}},
+    ])
+    def test_native_mention_predicate_rejects_malformed_payload(self, message):
+        assert not _message_mentions_bot(message, "Ubot")
+
+    def test_group_without_mention_is_dropped_before_reply_token(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        asyncio.run(ad._handle_message_event(self._event()))
+        ad.handle_message.assert_not_awaited()
+        assert "Cline" not in ad._reply_tokens
+
+    def test_group_media_without_mention_is_dropped_before_download(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        ad._client = MagicMock()
+        ad._client.fetch_content = AsyncMock(return_value=b"line-bytes")
+        event = self._event(message={"type": "video", "id": "m1"})
+        asyncio.run(ad._handle_message_event(event))
+        ad._client.fetch_content.assert_not_awaited()
+        ad.handle_message.assert_not_awaited()
+
+    def test_group_native_mention_is_dispatched(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        event = self._event(message={
+            "type": "text",
+            "id": "m1",
+            "text": "@bot hello",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+        asyncio.run(ad._handle_message_event(event))
+        ad.handle_message.assert_awaited_once()
+
+    def test_native_mention_survives_quote_index_read_failure(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "lookup",
+            MagicMock(side_effect=OSError("index unavailable")),
+        )
+        event = self._event(message={
+            "type": "text",
+            "id": "m1",
+            "text": "@bot hello",
+            "quotedMessageId": "unknown",
+            "mention": {"mentionees": [{"type": "user", "isSelf": True}]},
+        })
+
+        asyncio.run(ad._handle_message_event(event))
+
+        ad.handle_message.assert_awaited_once()
+
+    def test_group_reply_to_own_message_is_dispatched(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        monkeypatch.setattr(
+            _line.rich_sent_store,
+            "lookup",
+            lambda chat_id, message_id: "Hermes previously answered"
+            if (chat_id, message_id) == ("Cline", "bot-message-1")
+            else None,
+        )
+        event = self._event(message={
+            "type": "text",
+            "id": "m2",
+            "text": "繼續說明",
+            "quotedMessageId": "bot-message-1",
+        })
+        asyncio.run(ad._handle_message_event(event))
+        ad.handle_message.assert_awaited_once()
+        dispatched = ad.handle_message.await_args.args[0]
+        assert dispatched.reply_to_message_id == "bot-message-1"
+        assert dispatched.reply_to_text == "Hermes previously answered"
+        assert dispatched.reply_to_is_own_message is True
+
+    def test_group_reply_to_other_users_message_is_dropped(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda *_: None)
+        event = self._event(message={
+            "type": "text",
+            "id": "m2",
+            "text": "我也這麼認為",
+            "quotedMessageId": "other-user-message",
+        })
+        asyncio.run(ad._handle_message_event(event))
+        ad.handle_message.assert_not_awaited()
+
+    def test_reply_predicate_rejects_missing_or_unknown_quote(self, monkeypatch):
+        monkeypatch.setattr(_line.rich_sent_store, "lookup", lambda *_: None)
+        assert not _message_replies_to_bot({}, "Cline")
+        assert not _message_replies_to_bot(
+            {"quotedMessageId": "unknown"}, "Cline"
+        )
+
+    def test_outbound_index_persists_for_quote_detection(self, monkeypatch, tmp_path):
+        index_path = tmp_path / "rich_sent_index.json"
+        monkeypatch.setattr(
+            _line.rich_sent_store, "_store_path", lambda: str(index_path)
+        )
+        _record_sent_messages(
+            "Cline",
+            {"sentMessages": [{"id": "persisted-bot-message"}]},
+            [{"type": "text", "text": "Persisted answer"}],
+        )
+
+        assert index_path.exists()
+        assert _message_replies_to_bot(
+            {"quotedMessageId": "persisted-bot-message"}, "Cline"
+        )
+
+    def test_room_without_mention_is_dropped(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        asyncio.run(ad._handle_message_event(self._event(source_type="room")))
+        ad.handle_message.assert_not_awaited()
+
+    def test_disabled_gate_allows_unmentioned_group(self, monkeypatch):
+        ad = self._adapter(monkeypatch, require_mention=False)
+        asyncio.run(ad._handle_message_event(self._event()))
+        ad.handle_message.assert_awaited_once()
+
+    def test_dm_does_not_require_mention(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        event = {
+            "type": "message",
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "Uuser"},
+            "message": {"type": "text", "id": "m1", "text": "hello"},
+        }
+        asyncio.run(ad._handle_message_event(event))
+        ad.handle_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

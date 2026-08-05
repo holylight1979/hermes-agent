@@ -17,6 +17,7 @@ These tests drive the real ``compress_context`` path against a real SessionDB.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -195,6 +196,53 @@ class TestWorkspaceMetadataFollowsRotation:
         assert row["chat_id"] == "c1"
         assert row["chat_type"] == "private"
         assert row["user_id"] == "u1"
+
+    def test_rotation_persists_provenance_with_matching_lineage_ids(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_PROVENANCE_ROT"
+        db.create_session(parent, source="telegram")
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+
+        def _provenance(parent_id, child_id):
+            return {
+                "schema_version": 1,
+                "parent_session_id": parent_id,
+                "child_session_id": child_id,
+                "manifest_digest": "digest",
+            }
+
+        agent.context_compressor.get_last_fidelity_provenance.side_effect = _provenance
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = agent.session_id
+        config = json.loads(db.get_session(child)["model_config"])
+        record = config["_compression_fidelity"]
+        assert record["parent_session_id"] == parent
+        assert record["child_session_id"] == child
+
+    def test_rotation_without_provenance_leaves_model_config_untouched(
+        self, tmp_path: Path
+    ):
+        """Guard-off runs and engines without the API must not gain a key.
+
+        The stub compressor here returns a MagicMock (not a dict) from
+        ``get_last_fidelity_provenance`` — the same shape a legacy engine or a
+        guard-off run produces — so the child row must serialize exactly as it
+        did before the fidelity port.
+        """
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_NO_PROVENANCE_ROT"
+        db.create_session(parent, source="telegram")
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = agent.session_id
+        assert child != parent  # rotation happened
+        raw_config = db.get_session(child)["model_config"]
+        assert "_compression_fidelity" not in (raw_config or "")
 
 
 class TestPlatformForwardedAtBoundary:

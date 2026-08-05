@@ -52,6 +52,11 @@ _WHATSAPP_JID_RE = re.compile(
     r"^\s*[\w-]+@(?:g\.us|s\.whatsapp\.net|lid|broadcast|newsletter)\s*$",
     re.IGNORECASE,
 )
+# LINE platform IDs are a one-letter source prefix followed by 32 hexadecimal
+# characters: U=user/DM, C=group, R=multi-user room. Treat these as explicit
+# destinations so ``hermes send --to line:C...`` does not incorrectly attempt
+# channel-name resolution and then fall back to a configured home channel.
+_LINE_TARGET_RE = re.compile(r"^\s*([UCR][0-9A-Fa-f]{32})\s*$")
 # Email addresses — a valid email like "user@domain.com" should be treated as
 # an explicit target for the email platform, not fall through to channel-name
 # resolution which has no way to resolve a raw address.
@@ -568,6 +573,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return trimmed[:split_idx], trimmed[split_idx + 1 :], True
     if platform_name == "weixin":
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
+    if platform_name == "line":
+        match = _LINE_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
     if platform_name == "yuanbao":

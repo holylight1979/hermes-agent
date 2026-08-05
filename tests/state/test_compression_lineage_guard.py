@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import COMPRESSION_FIDELITY_CONFIG_KEY, SessionDB
 
 
 @pytest.fixture()
@@ -121,6 +123,80 @@ def test_publish_compression_child_exposes_complete_child(db: SessionDB) -> None
     assert child["id"] == "atomic-child"
     assert child["system_prompt"] == "compressed system"
     assert [m["content"] for m in db.get_messages("atomic-child")] == ["summary"]
+
+
+def test_publish_compression_child_persists_provenance_without_mutating_config(
+    db: SessionDB,
+) -> None:
+    db.create_session("provenance-parent", source="webui")
+    assert db.try_acquire_compression_lock(
+        "provenance-parent", "winner", ttl_seconds=60
+    )
+    model_config = {"temperature": 0.2}
+    provenance = {
+        "schema_version": 1,
+        "parent_session_id": "provenance-parent",
+        "child_session_id": "provenance-child",
+        "manifest_digest": "digest",
+    }
+
+    db.publish_compression_child(
+        parent_session_id="provenance-parent",
+        child_session_id="provenance-child",
+        source="webui",
+        messages=[{"role": "user", "content": "summary"}],
+        model_config=model_config,
+        compression_fidelity_provenance=provenance,
+        compression_lock_holder="winner",
+    )
+
+    assert model_config == {"temperature": 0.2}
+    child_config = json.loads(db.get_session("provenance-child")["model_config"])
+    assert child_config["temperature"] == 0.2
+    assert child_config[COMPRESSION_FIDELITY_CONFIG_KEY] == provenance
+
+
+def test_publish_without_provenance_preserves_existing_model_config_shape(
+    db: SessionDB,
+) -> None:
+    db.create_session("plain-parent", source="webui")
+    assert db.try_acquire_compression_lock("plain-parent", "winner", ttl_seconds=60)
+
+    db.publish_compression_child(
+        parent_session_id="plain-parent",
+        child_session_id="plain-child",
+        source="webui",
+        messages=[{"role": "user", "content": "summary"}],
+        model_config={"temperature": 0.1},
+        compression_lock_holder="winner",
+    )
+
+    child_config = json.loads(db.get_session("plain-child")["model_config"])
+    assert child_config == {"temperature": 0.1}
+
+
+def test_provenance_rolls_back_with_failed_handoff(db: SessionDB, monkeypatch) -> None:
+    db.create_session("rollback-parent", source="webui")
+    assert db.try_acquire_compression_lock(
+        "rollback-parent", "winner", ttl_seconds=60
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("handoff insert failed")
+
+    monkeypatch.setattr(db, "_insert_message_rows", _boom)
+    with pytest.raises(RuntimeError, match="handoff insert failed"):
+        db.publish_compression_child(
+            parent_session_id="rollback-parent",
+            child_session_id="rollback-child",
+            source="webui",
+            messages=[{"role": "user", "content": "summary"}],
+            compression_fidelity_provenance={"schema_version": 1},
+            compression_lock_holder="winner",
+        )
+
+    assert db.get_session("rollback-parent")["ended_at"] is None
+    assert db.get_session("rollback-child") is None
 
 
 def test_publish_compression_child_rejects_lost_or_expired_lease(db: SessionDB) -> None:

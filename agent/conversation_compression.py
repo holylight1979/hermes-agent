@@ -3255,6 +3255,24 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
+                    # Content-free fidelity audit record for this boundary. It
+                    # must be minted here — after both lineage ids exist and
+                    # before publication — so the record commits inside the same
+                    # transaction as the child it describes. Guard-off runs and
+                    # legacy/stub compressors without the API contribute None,
+                    # leaving model_config exactly as before.
+                    _fidelity_provenance = None
+                    _provenance_reader = getattr(
+                        getattr(agent, "context_compressor", None),
+                        "get_last_fidelity_provenance",
+                        None,
+                    )
+                    if callable(_provenance_reader):
+                        _record = _provenance_reader(
+                            old_session_id, new_session_id
+                        )
+                        if isinstance(_record, dict):
+                            _fidelity_provenance = _record
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
@@ -3262,6 +3280,7 @@ def compress_context(
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
                         model_config=agent._session_init_model_config,
+                        compression_fidelity_provenance=_fidelity_provenance,
                         system_prompt=new_system_prompt,
                         messages=compressed,
                         cwd=getattr(agent, "working_directory", None),
