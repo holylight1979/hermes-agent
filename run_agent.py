@@ -251,6 +251,12 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # pre-action notice gate: the placeholder assistant turn that stands in
+    # for a discarded (never dispatched) tool batch, and the user nudge that
+    # asks for a proper 執行目標／預估 notice before the calls are re-issued.
+    # Neither is transcript — persisting them would replay an internal
+    # formatting instruction as user-authored context on resume.
+    "_pre_action_notice_synthetic",
 )
 
 

@@ -73,6 +73,11 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length,
 )
+from agent.pre_action_notice import (
+    PRE_ACTION_NOTICE_STOP,
+    build_pre_action_notice_scaffolding,
+    has_valid_pre_action_notice,
+)
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
     build_prompt_cache_plan,
@@ -5954,6 +5959,101 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                # ── Pre-action notice gate ────────────────────────────
+                # Before ANY dispatch, validation, repair or persistence
+                # touches this batch: when the gate is on, the turn must have
+                # already told the user in plain Traditional Chinese what it
+                # is about to do ("執行目標：...") and roughly how long it
+                # will take ("預估"/"概估"). This sits at the very top of the
+                # branch on purpose — a batch that fails here must produce
+                # zero side effects, so it may not reach _execute_tool_calls,
+                # the pre-execution session flush, or the interim emit.
+                # Think-block text is stripped first: hidden reasoning is not
+                # a notice the user can see.
+                if getattr(agent, "require_pre_action_notice", False):
+                    _notice_text = agent._strip_think_blocks(
+                        assistant_message.content or ""
+                    )
+                    if not has_valid_pre_action_notice(_notice_text):
+                        _pan_max = getattr(agent, "pre_action_notice_max_retries", 2)
+                        _pan_used = getattr(agent, "_pre_action_notice_retries", 0)
+                        _n_calls = len(assistant_message.tool_calls)
+                        if _pan_used < _pan_max:
+                            agent._pre_action_notice_retries = _pan_used + 1
+                            logger.warning(
+                                "Pre-action notice missing — discarding %d tool "
+                                "call(s) before dispatch and re-prompting "
+                                "(retry %d/%d, model=%s)",
+                                _n_calls,
+                                agent._pre_action_notice_retries,
+                                _pan_max,
+                                agent.model,
+                            )
+                            agent._emit_status(
+                                "⏸ 尚未執行任何工具：正在要求代理補上執行目標與時間預估 "
+                                f"({agent._pre_action_notice_retries}/{_pan_max})"
+                            )
+                            # The discarded calls are NOT written back — an
+                            # assistant(tool_calls) row with no matching tool
+                            # result is an illegal pairing for every provider.
+                            # The scaffolding pair keeps role alternation valid
+                            # for the retry and is flagged ephemeral so neither
+                            # persistence nor compression ever sees it.
+                            _pan_assistant, _pan_nudge = (
+                                build_pre_action_notice_scaffolding(_notice_text)
+                            )
+                            messages.append(_pan_assistant)
+                            messages.append(_pan_nudge)
+                            agent._session_messages = messages
+                            final_response = None
+                            continue
+
+                        # Budget spent: stop the turn visibly, still without
+                        # running anything.
+                        logger.warning(
+                            "Pre-action notice still missing after %d retries — "
+                            "stopping the turn with %d tool call(s) unexecuted "
+                            "(model=%s)",
+                            _pan_max, _n_calls, agent.model,
+                        )
+                        agent._pre_action_notice_retries = 0
+                        # Drop the trailing scaffolding so the stop message
+                        # follows the last real turn instead of an internal
+                        # nudge.
+                        while (
+                            messages
+                            and isinstance(messages[-1], dict)
+                            and messages[-1].get("_pre_action_notice_synthetic")
+                        ):
+                            messages.pop()
+                        _turn_exit_reason = "pre_action_notice_missing"
+                        final_response = PRE_ACTION_NOTICE_STOP
+                        agent._emit_status("⛔ 已停止：缺少執行前預告，未執行任何工具")
+                        messages.append(
+                            {"role": "assistant", "content": final_response}
+                        )
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": final_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "error": final_response,
+                            "turn_exit_reason": _turn_exit_reason,
+                        }
+
+                    # Cleared for dispatch — the next stall gets a fresh
+                    # budget rather than inheriting this turn's.
+                    agent._pre_action_notice_retries = 0
+
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -7032,6 +7132,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_pre_action_notice_synthetic")
                     )
                 ):
                     messages.pop()

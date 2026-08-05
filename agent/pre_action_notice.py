@@ -66,4 +66,59 @@ def has_valid_pre_action_notice(content: object) -> bool:
     return bool(goal_text.strip(_FILLER))
 
 
-__all__ = ["has_valid_pre_action_notice"]
+# ── Gate messaging ────────────────────────────────────────────────────
+# The gate discards a non-conforming tool batch, so the model has to be told
+# what to do instead. Kept here, next to the predicate, so the wording and the
+# rule it enforces cannot drift apart.
+
+PRE_ACTION_NOTICE_NUDGE = (
+    "你剛才的回合直接發出工具呼叫，但沒有先向使用者說明。系統已捨棄那批工具呼叫，"
+    "沒有執行任何工具。\n"
+    "請先用繁體中文輸出一段白話預告，必須同時包含：\n"
+    "1. 「執行目標：」後面接這次要完成的具體事情。\n"
+    "2. 「預估」或「概估」後面接大概需要的時間。\n"
+    "輸出預告之後，在同一個回合重新發出你原本需要的工具呼叫。"
+)
+
+PRE_ACTION_NOTICE_STOP = (
+    "已停止：代理未提供必要的執行前預告（「執行目標：」與「預估」時間），"
+    "因此沒有執行工具。"
+)
+
+# Stands in for the discarded turn so the nudge below it has an assistant turn
+# to alternate with. Deliberately states that nothing was announced rather
+# than inventing a goal — a placebo notice here would let the model believe it
+# had already explained itself.
+PRE_ACTION_NOTICE_PLACEHOLDER = "（本回合未提供執行前預告，工具呼叫已捨棄。）"
+
+
+def build_pre_action_notice_scaffolding(content: object) -> tuple[dict, dict]:
+    """Return the ephemeral (assistant, user) pair that drives one gate retry.
+
+    The assistant half carries **no** ``tool_calls``: the discarded batch must
+    never re-enter the conversation, or the provider would expect tool results
+    that will never exist. Both halves are flagged so persistence and
+    compression treat them as internal retry state, not transcript.
+    """
+    visible = content.strip() if isinstance(content, str) else ""
+    return (
+        {
+            "role": "assistant",
+            "content": visible or PRE_ACTION_NOTICE_PLACEHOLDER,
+            "_pre_action_notice_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": PRE_ACTION_NOTICE_NUDGE,
+            "_pre_action_notice_synthetic": True,
+        },
+    )
+
+
+__all__ = [
+    "has_valid_pre_action_notice",
+    "build_pre_action_notice_scaffolding",
+    "PRE_ACTION_NOTICE_NUDGE",
+    "PRE_ACTION_NOTICE_STOP",
+    "PRE_ACTION_NOTICE_PLACEHOLDER",
+]
