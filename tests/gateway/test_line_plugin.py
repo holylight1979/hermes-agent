@@ -46,6 +46,7 @@ validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
+_mentions_bot = _line._mentions_bot
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +179,10 @@ class TestInboundMedia:
     def adapter(self, monkeypatch):
         monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
         monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        # These events are unmentioned group messages: pin the mention gate off so
+        # this class tests media normalization, not the gate (and so a developer's
+        # own LINE_REQUIRE_MENTION can't leak in).
+        monkeypatch.delenv("LINE_REQUIRE_MENTION", raising=False)
         from gateway.config import PlatformConfig
 
         cfg = PlatformConfig(enabled=True, extra={
@@ -558,4 +563,245 @@ class TestMediaPublicUrlGuard:
         result = asyncio.run(ad.send_image_file("Uchat", str(img)))
         assert not result.success
         assert "LINE_PUBLIC_URL" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# 11. require_mention gate for groups / rooms
+# ---------------------------------------------------------------------------
+
+_BOT_ID = "Ubot"
+
+
+class TestMentionsBot:
+    """Only LINE's native mention metadata naming *this* bot counts."""
+
+    def test_matching_user_mention(self):
+        msg = {"type": "text", "text": "@bot hi",
+               "mention": {"mentionees": [
+                   {"index": 0, "length": 4, "type": "user", "userId": _BOT_ID}]}}
+        assert _mentions_bot(msg, _BOT_ID)
+
+    def test_legacy_payload_without_type_field(self):
+        # Older LINE payloads omit "type" — those are always user mentions.
+        msg = {"mention": {"mentionees": [{"index": 0, "length": 4, "userId": _BOT_ID}]}}
+        assert _mentions_bot(msg, _BOT_ID)
+
+    def test_other_user_mention_does_not_match(self):
+        msg = {"mention": {"mentionees": [
+            {"index": 0, "length": 4, "type": "user", "userId": "Usomeone"}]}}
+        assert not _mentions_bot(msg, _BOT_ID)
+
+    def test_mention_all_is_not_a_bot_mention(self):
+        # @All carries type="all" and no userId — a broadcast is not an address to the bot.
+        msg = {"mention": {"mentionees": [{"index": 0, "length": 4, "type": "all"}]}}
+        assert not _mentions_bot(msg, _BOT_ID)
+
+    def test_mention_all_with_bot_userid_still_rejected(self):
+        # Defensive: even if a payload tags an "all" mentionee with our id.
+        msg = {"mention": {"mentionees": [
+            {"index": 0, "length": 4, "type": "all", "userId": _BOT_ID}]}}
+        assert not _mentions_bot(msg, _BOT_ID)
+
+    def test_no_mention_metadata(self):
+        assert not _mentions_bot({"type": "text", "text": "hello"}, _BOT_ID)
+
+    def test_malformed_mention_metadata(self):
+        assert not _mentions_bot({"mention": {"mentionees": "nope"}}, _BOT_ID)
+        assert not _mentions_bot({"mention": {"mentionees": ["nope"]}}, _BOT_ID)
+        assert not _mentions_bot({"mention": None}, _BOT_ID)
+
+    def test_unknown_bot_id_fails_closed(self):
+        msg = {"mention": {"mentionees": [{"type": "user", "userId": _BOT_ID}]}}
+        assert not _mentions_bot(msg, None)
+        assert not _mentions_bot(msg, "")
+
+
+class TestRequireMentionConfig:
+    """LINE_REQUIRE_MENTION overrides extra.require_mention; extra is the default."""
+
+    def _adapter(self, monkeypatch, **extra):
+        from gateway.config import PlatformConfig
+        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET"):
+            monkeypatch.delenv(k, raising=False)
+        base = {"channel_access_token": "tok", "channel_secret": "sec"}
+        base.update(extra)
+        return LineAdapter(PlatformConfig(enabled=True, extra=base))
+
+    def test_defaults_off(self, monkeypatch):
+        monkeypatch.delenv("LINE_REQUIRE_MENTION", raising=False)
+        assert self._adapter(monkeypatch).require_mention is False
+
+    def test_extra_is_the_default_source(self, monkeypatch):
+        monkeypatch.delenv("LINE_REQUIRE_MENTION", raising=False)
+        assert self._adapter(monkeypatch, require_mention=True).require_mention is True
+        assert self._adapter(monkeypatch, require_mention=False).require_mention is False
+
+    def test_extra_accepts_yaml_strings(self, monkeypatch):
+        monkeypatch.delenv("LINE_REQUIRE_MENTION", raising=False)
+        assert self._adapter(monkeypatch, require_mention="true").require_mention is True
+        # A bare bool() would read "false" as True — it must not.
+        assert self._adapter(monkeypatch, require_mention="false").require_mention is False
+
+    @pytest.mark.parametrize("raw", ["true", "True", "1", "yes", "on"])
+    def test_env_true_variants(self, monkeypatch, raw):
+        monkeypatch.setenv("LINE_REQUIRE_MENTION", raw)
+        assert self._adapter(monkeypatch, require_mention=False).require_mention is True
+
+    @pytest.mark.parametrize("raw", ["false", "0", "no", "off", ""])
+    def test_env_false_variants_override_extra(self, monkeypatch, raw):
+        monkeypatch.setenv("LINE_REQUIRE_MENTION", raw)
+        assert self._adapter(monkeypatch, require_mention=True).require_mention is False
+
+
+class TestRequireMentionGate:
+    """The gate must run before the reply token is stashed, before media is
+    downloaded, and before the agent is invoked."""
+
+    def _adapter(self, monkeypatch, *, require_mention=True, bot_id=_BOT_ID):
+        from gateway.config import PlatformConfig
+        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET",
+                  "LINE_REQUIRE_MENTION"):
+            monkeypatch.delenv(k, raising=False)
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "require_mention": require_mention,
+        })
+        ad = LineAdapter(cfg)
+        ad._bot_user_id = bot_id
+        ad._client = MagicMock()
+        ad._client.fetch_content = AsyncMock(return_value=b"line-bytes")
+        ad._client.loading = AsyncMock()
+        ad._client.reply = AsyncMock()
+        ad._client.push = AsyncMock()
+        ad.handle_message = AsyncMock()
+        return ad
+
+    def _event(self, *, source_type="group", msg=None, mentionees=None):
+        source = {
+            "group": {"type": "group", "groupId": "Cgroup", "userId": "Umember"},
+            "room": {"type": "room", "roomId": "Rroom", "userId": "Umember"},
+            "user": {"type": "user", "userId": "Umember"},
+        }[source_type]
+        message = dict(msg or {"type": "text", "id": "m-1", "text": "hello"})
+        if mentionees is not None:
+            message["mention"] = {"mentionees": mentionees}
+        return {
+            "type": "message",
+            "replyToken": "reply-token",
+            "source": source,
+            "message": message,
+        }
+
+    def _run(self, adapter, event):
+        async def _go():
+            await adapter._handle_message_event(event)
+            # Let any fire-and-forget task (the DM loading indicator) settle.
+            await asyncio.sleep(0)
+        asyncio.run(_go())
+
+    def _assert_ignored(self, adapter):
+        adapter.handle_message.assert_not_awaited()
+        assert adapter._reply_tokens == {}
+        adapter._client.fetch_content.assert_not_awaited()
+
+    # -- gate disabled / DM: unchanged behaviour ------------------------
+
+    def test_group_passes_when_gate_disabled(self, monkeypatch):
+        ad = self._adapter(monkeypatch, require_mention=False)
+        self._run(ad, self._event())
+        ad.handle_message.assert_awaited_once()
+        assert ad._reply_tokens["Cgroup"][0] == "reply-token"
+
+    def test_dm_passes_when_gate_enabled(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(source_type="user"))
+        ad.handle_message.assert_awaited_once()
+        assert ad._reply_tokens["Umember"][0] == "reply-token"
+
+    # -- gate enabled: pass only on an explicit bot mention -------------
+
+    def test_group_mentioning_bot_passes(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(
+            mentionees=[{"index": 0, "length": 4, "type": "user", "userId": _BOT_ID}]))
+        ad.handle_message.assert_awaited_once()
+        assert ad._reply_tokens["Cgroup"][0] == "reply-token"
+
+    def test_room_mentioning_bot_passes(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(
+            source_type="room",
+            mentionees=[{"index": 0, "length": 4, "type": "user", "userId": _BOT_ID}]))
+        ad.handle_message.assert_awaited_once()
+        assert ad._reply_tokens["Rroom"][0] == "reply-token"
+
+    def test_group_without_mention_ignored(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event())
+        self._assert_ignored(ad)
+
+    def test_room_without_mention_ignored(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(source_type="room"))
+        self._assert_ignored(ad)
+
+    def test_group_mentioning_someone_else_ignored(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(
+            mentionees=[{"index": 0, "length": 6, "type": "user", "userId": "Uother"}]))
+        self._assert_ignored(ad)
+
+    def test_mention_all_ignored(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(
+            mentionees=[{"index": 0, "length": 4, "type": "all"}]))
+        self._assert_ignored(ad)
+
+    def test_missing_bot_user_id_fails_closed(self, monkeypatch):
+        # get_bot_user_id() failed at connect — we cannot prove the mention is
+        # ours, so nothing from a group may reach the agent.
+        ad = self._adapter(monkeypatch, bot_id=None)
+        self._run(ad, self._event(
+            mentionees=[{"index": 0, "length": 4, "type": "user", "userId": _BOT_ID}]))
+        self._assert_ignored(ad)
+
+    # -- the gate runs BEFORE media download ---------------------------
+
+    def test_unmentioned_image_is_not_downloaded(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        with patch.object(_line, "cache_image_from_bytes_async", new=AsyncMock()) as cache:
+            self._run(ad, self._event(msg={"type": "image", "id": "img-1"}))
+        cache.assert_not_awaited()
+        self._assert_ignored(ad)
+
+    @pytest.mark.parametrize("msg", [
+        {"type": "text", "id": "m-1", "text": "just chatting"},
+        {"type": "sticker", "id": "m-2", "keywords": ["hi"]},
+        {"type": "image", "id": "m-3"},
+        {"type": "audio", "id": "m-4"},
+        {"type": "video", "id": "m-5"},
+        {"type": "file", "id": "m-6", "fileName": "x.pdf"},
+        {"type": "location", "id": "m-7", "title": "t", "address": "a"},
+    ], ids=lambda m: m["type"])
+    def test_every_unmentioned_message_type_is_dropped(self, monkeypatch, msg):
+        ad = self._adapter(monkeypatch)
+        self._run(ad, self._event(msg=msg))
+        self._assert_ignored(ad)
+
+    # -- postback is unaffected ----------------------------------------
+
+    def test_postback_still_delivers_with_gate_enabled(self, monkeypatch):
+        ad = self._adapter(monkeypatch)
+        rid = ad._cache.register_pending("Cgroup")
+        ad._cache.set_ready(rid, "the answer")
+        asyncio.run(ad._handle_postback_event({
+            "type": "postback",
+            "replyToken": "fresh-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Umember"},
+            "postback": {"data": json.dumps(
+                {"action": "show_response", "request_id": rid})},
+        }))
+        ad._client.reply.assert_awaited_once()
+        assert ad._cache.get(rid).state is State.DELIVERED
 

@@ -344,9 +344,42 @@ def _csv_set(value: str) -> Set[str]:
     return {x.strip() for x in (value or "").split(",") if x.strip()}
 
 
+def _truthy(value: Any, default: bool = False) -> bool:
+    """Coerce a config value to bool. YAML may hand us a real bool or a string."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _truthy_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    return default if v is None else v.strip().lower() in {"1", "true", "yes", "on"}
+    return _truthy(os.getenv(name), default)
+
+
+def _mentions_bot(message: Dict[str, Any], bot_user_id: Optional[str]) -> bool:
+    """True only when LINE's native mention metadata names *this* bot.
+
+    LINE attaches ``message.mention.mentionees`` — a list of ``{"index", "length",
+    "type": "user"|"all", "userId"}`` — to text messages carrying an @mention. The
+    match is strictly on ``userId == bot_user_id``: ``@All`` arrives as
+    ``{"type": "all"}`` with no ``userId`` (a broadcast is not an address to the
+    bot), mentions of other members carry their own id, and absent metadata
+    (plain chatter, stickers, media) never matches — fail-closed by construction.
+    """
+    if not bot_user_id:
+        return False
+    mentionees = ((message or {}).get("mention") or {}).get("mentionees")
+    if not isinstance(mentionees, list):
+        return False
+    for mentionee in mentionees:
+        # ``type`` is absent on older payloads (always user mentions then);
+        # anything explicitly non-"user" (i.e. "all") is not us.
+        if not isinstance(mentionee, dict) or mentionee.get("type") not in (None, "user"):
+            continue
+        if mentionee.get("userId") == bot_user_id:
+            return True
+    return False
 
 
 def _credentials(config) -> Tuple[str, str]:
@@ -404,6 +437,9 @@ class LineAdapter(BasePlatformAdapter):
         self.allowed_users = allowlist("LINE_ALLOWED_USERS", "allowed_users")
         self.allowed_groups = allowlist("LINE_ALLOWED_GROUPS", "allowed_groups")
         self.allowed_rooms = allowlist("LINE_ALLOWED_ROOMS", "allowed_rooms")
+        # Group/room mention gate. ``extra.require_mention`` is the config source;
+        # ``LINE_REQUIRE_MENTION`` overrides it (env-wins, like the knobs above). DMs are never gated.
+        self.require_mention = _truthy_env("LINE_REQUIRE_MENTION", _truthy(extra.get("require_mention"), False))
         # Slow-LLM postback button threshold + user-overridable copy
         threshold = env_or("LINE_SLOW_RESPONSE_THRESHOLD", "slow_response_threshold", DEFAULT_SLOW_RESPONSE_THRESHOLD)
         self.slow_response_threshold = _coerce(float, threshold, DEFAULT_SLOW_RESPONSE_THRESHOLD)
@@ -449,6 +485,12 @@ class LineAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("LINE: get_bot_user_id failed: %s", exc)
             self._bot_user_id = None
+        if self.require_mention:
+            if self._bot_user_id:
+                logger.info("LINE: require_mention is ON — group/room messages must @mention this bot")
+            else:
+                logger.warning("LINE: require_mention is ON but this channel's bot userId could not be "
+                               "resolved — ALL group/room messages will be ignored until it is (fail closed)")
         try:
             from aiohttp import web
         except ImportError:
@@ -550,6 +592,26 @@ class LineAdapter(BasePlatformAdapter):
         else:
             logger.debug("LINE: ignoring event type %r", event_type)
 
+    def _passes_mention_gate(self, msg: Dict[str, Any], chat_type: str, chat_id: str) -> bool:
+        """Group/room gate: with ``require_mention`` on, only an explicit @mention of this bot
+        may reach the agent.
+
+        DMs (``chat_type == "dm"``) are never gated — a 1:1 message is already addressed to the
+        bot. Everything else fails closed: no mention metadata, a mention of someone else, or an
+        unknown bot userId all drop the message.
+        """
+        if not self.require_mention or chat_type not in ("group", "room"):
+            return True
+        if not self._bot_user_id:
+            logger.info("LINE: ignoring %s message in %s — require_mention is on but the bot userId "
+                        "is unknown (fail closed)", chat_type, chat_id)
+            return False
+        if _mentions_bot(msg, self._bot_user_id):
+            logger.debug("LINE: mention gate passed for %s %s", chat_type, chat_id)
+            return True
+        logger.info("LINE: ignoring unmentioned %s message in %s (require_mention)", chat_type, chat_id)
+        return False
+
     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
         msg = event.get("message") or {}
         msg_type, message_id = msg.get("type", ""), msg.get("id", "")
@@ -557,6 +619,10 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        # Mention gate FIRST — before the reply token is stashed, before any media is
+        # downloaded, before a MessageEvent reaches the agent.
+        if not self._passes_mention_gate(msg, chat_type, chat_id):
+            return
         if chat_id and reply_token:  # stash the reply token for outbound use
             self._reply_tokens[chat_id] = (reply_token, time.time() + LINE_REPLY_TOKEN_TTL_SECONDS)
         media_urls: List[str] = []
