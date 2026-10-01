@@ -167,6 +167,45 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
             logger.debug("hygiene failure streak persistent reset failed: %s", exc)
 
 
+def _retire_stale_hygiene_usage(gateway, session_key: str, session_id: str) -> None:
+    """Retire the session's last API-reported prompt_tokens after a DETACHED hygiene compaction
+    committed off-turn.
+
+    ``_hmwa_hygiene_plan`` trusts ``session_entry.last_prompt_tokens`` first and unconditionally
+    ("actual"), but that figure prices the transcript the compaction just replaced. Inline
+    adoption zeroes it (``_hmwa_hygiene_adopt_transcript``); a watermark-fenced worker that
+    commits AFTER its turn was released never reaches that code, so the next message read the
+    pre-compaction count, cleared the threshold and re-compressed an already-compacted session
+    (#97963 follow-up: "messages=49->45 rough_tokens=~21,411" then, two seconds later,
+    "46 messages, ~64,288 tokens (actual) — auto-compressing").
+
+    Zero means "no real reading", not "empty context": the plan then falls back to the persisted
+    usage anchor and finally to the rough estimate, both computed against the LIVE transcript.
+    A reading captured after the commit is not stale and is kept — compaction clears the row's
+    usage anchor (``set_usage_anchor(agent, None)``) and only a real provider response
+    re-persists one, so a present anchor proves real usage was seen since the commit.
+
+    ``session_id`` is the session the compaction actually committed against. The callback fires
+    off-turn, so ``/new`` (or an auto-reset) may already have rebound ``session_key`` onto a fresh
+    session with its own real reading; the write is a compare-and-set on that id so another
+    session's usage is never retired.
+    """
+    from agent.usage_anchor import USAGE_ANCHOR_MODEL_CONFIG_KEY
+    getter = getattr(_gateway_session_db_inner(gateway), "get_session_model_config_value", None)
+    if callable(getter):
+        try:
+            if isinstance(getter(session_id, USAGE_ANCHOR_MODEL_CONFIG_KEY, None), dict):
+                return
+        except Exception as exc:
+            logger.debug("hygiene usage-anchor probe failed: %s", exc)
+    try:
+        gateway.session_store.update_session(
+            session_key, last_prompt_tokens=0, touch_activity=False, expect_session_id=session_id,
+        )
+    except Exception as exc:
+        logger.debug("hygiene stale usage retirement failed: %s", exc)
+
+
 def hygiene_compaction_recovered(
     *, aborted: bool, rotated: bool, in_place: bool, msg_count: int, new_count: int,
     approx_tokens: int, new_tokens: int) -> bool:

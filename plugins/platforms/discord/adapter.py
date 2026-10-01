@@ -984,6 +984,7 @@ def _read_discord_prompt_timeout() -> int:
 
 
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
+from plugins.platforms.discord.admission_hook import consume_claimed
 
 
 class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
@@ -1425,6 +1426,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
+        if consume_claimed(self, message):
+            return False
         admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
             return False
@@ -2186,6 +2189,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
+        if consume_claimed(self, message, recovered=True):
+            return False
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)

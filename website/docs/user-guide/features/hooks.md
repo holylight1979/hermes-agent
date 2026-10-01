@@ -463,6 +463,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
 | `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
+| [`pre_platform_message_admission`](#pre_platform_message_admission) | Directive/control | Once per inbound platform message, **before** the adapter's own ingress admission (allowlist, mention gate, dedup claim) and therefore before any `MessageEvent` exists; the only directive is `consume`. Fired today by the Discord adapter, on both the live and recovered dispatch paths. Python plugins only. | `platform`, `identity`, `message`, `adapter` | `identity` and the raw SDK `message` carry user ids, display names, and message content; `adapter` is a live platform handle with send access and credentials. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
@@ -1223,6 +1224,58 @@ def buffer_or_rewrite(event, **kwargs):
 
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", buffer_or_rewrite)
+```
+
+---
+
+### `pre_platform_message_admission`
+
+Fires **once per inbound platform message, before the adapter's ingress admission** — before the allowlist check, the mention gate, and the dedup claim, and therefore before a `MessageEvent` exists at all. `pre_gateway_dispatch` cannot reach this seam: admission has already dropped the message by then. Use it when a plugin needs to *own* a channel's traffic (a translation bridge, an archiver) including traffic the adapter would otherwise discard.
+
+**Callback signature:**
+
+```python
+def my_callback(platform, identity, message, adapter, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `platform` | `str` | Stable platform id; `"discord"` is the only emitter today. Always check it. |
+| `identity` | `dict` | Adapter-built, derived from SDK objects only (never from message text). `str`/`bool`/`None` values: `guild_id`, `chat_id`, `parent_chat_id`, `thread_id`, `message_id`, `user_id`, `user_name`, `is_bot`, `is_webhook`, `is_self`, `is_dm`, `message_type`, `mentions_self`, `has_attachments`, `recovered`. |
+| `message` | SDK object | The raw platform message (e.g. `discord.Message`), untouched. |
+| `adapter` | adapter | The live platform adapter, so the plugin can send its own output. |
+
+**Return value:** `None` or a dict. **Consume-only** — `{"action": "consume", "reason": "..."}` is the single directive, and the first callback that returns it wins.
+
+| Return | Effect |
+|--------|--------|
+| `{"action": "consume", "reason": "..."}` | The adapter stops processing that message entirely: no admission, no dedup claim, no auth, no dispatch, no command handling. |
+| `None` / anything else | Admission proceeds exactly as it would have without the hook. |
+
+There is deliberately **no `allow`/`admit`/`rewrite` verb**. This surface can only remove a message from the pipeline, never introduce one, so it cannot be used to walk a non-allowlisted user into the agent, a slash command, or an admin path.
+
+**Failure is fail-open to the unchanged baseline:** a raising callback, a missing subsystem, or a malformed return value all leave admission exactly as it was. Note the silence of that fallback — a plugin that owns a channel stops owning it, and the channel reverts to ordinary admission, without an error.
+
+`identity["recovered"]` is `True` on the adapter's missed-message backfill after downtime. Consuming a recovered message is usually right; *acting* on one replays history, so decide explicitly.
+
+**Shell hooks are refused** for this hook: a shell hook has no channel for the consume directive, and silently ignoring it would leave a message the plugin believes it owns in the normal agent flow.
+
+**Callbacks run synchronously and unbounded** (no `plugins.hook_callback_timeout`), on the gateway's event loop: neither timeout fail mode is acceptable here — abandoning the callback would either leak a message the plugin owns into the agent, or drop one it never claimed. Return the directive immediately and push real work onto the running loop as a task.
+
+**Example — consume a channel's traffic and handle it out of band:**
+
+```python
+def claim_bridged_channel(platform=None, identity=None, message=None, adapter=None, **kwargs):
+    if platform != "discord" or identity.get("chat_id") != BRIDGED_CHANNEL_ID:
+        return None
+    if identity["is_bot"] or identity["is_webhook"] or identity["is_self"]:
+        return None
+    if not identity["recovered"]:
+        asyncio.get_running_loop().create_task(_forward(message, adapter))
+    return {"action": "consume", "reason": "my-bridge"}
+
+def register(ctx):
+    ctx.register_hook("pre_platform_message_admission", claim_bridged_channel)
 ```
 
 ---

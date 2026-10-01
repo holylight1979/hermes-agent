@@ -470,6 +470,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        # Sessions whose completion receipt is being written outside _lock; the exactly-once
+        # claim for _move_to_finished while the session is still listed in _running.
+        self._persisting: set = set()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -1256,15 +1259,40 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
         Idempotent: kill_process() and the reader thread can both call this; only
-        the FIRST move enqueues the completion notification, so no duplicates."""
+        the FIRST move enqueues the completion notification, so no duplicates.
+
+        The receipt write runs OUTSIDE ``_lock``. It is disk I/O on a profile directory that
+        can stall for a long time (an unwritable ``logs/process-results`` on Windows was
+        measured blocking for minutes), and ``_lock`` is on the gateway event loop's path —
+        ``_run_process_watcher`` calls ``get()`` straight from the loop thread, so a slow
+        write there froze every heartbeat. Durability is unchanged: ``_persisting`` claims the
+        move exactly once, the session stays in ``_running`` until the receipt lands, and the
+        completion event/notification still fire only after it."""
         with self._lock:
+            if session.id in self._persisting:
+                # The claiming thread owns the rest of the move, event included.
+                return
             was_running = session.id in self._running
             if was_running:
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
+                self._persisting.add(session.id)
+            else:
+                self._finished[session.id] = session
+        if was_running:
+            try:
+                # A finite parent must not observe completion and exit during this write, so
+                # the session stays in _running (and unsignalled) until the result is durable.
                 save_completed_result(session)
-                self._running.pop(session.id)
-            self._finished[session.id] = session
+            except Exception:
+                # save_completed_result already degrades a disk OSError to "live delivery,
+                # no durability". Anything else (a redactor raising, say) degrades the same
+                # way: the process HAS exited, and letting the receipt swallow the move would
+                # strand every _completion_event waiter and drop the notification for good.
+                logger.warning("Could not write completion receipt for %s", session.id, exc_info=True)
+            finally:
+                with self._lock:
+                    self._running.pop(session.id, None)
+                    self._finished[session.id] = session
+                    self._persisting.discard(session.id)
         self._write_checkpoint()
         if was_running and session.notify_on_complete:
             notification = {

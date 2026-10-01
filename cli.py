@@ -41,6 +41,7 @@ from hermes_cli.cli_terminal_mixin import CLITerminalMixin
 from hermes_cli.cli_modal_mixin import CLIModalMixin
 from hermes_cli.cli_stream_mixin import CLIStreamMixin
 from hermes_cli.cli_session_mixin import CLISessionMixin
+from hermes_cli.cli_detour_mixin import CLIDetourMixin
 from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
 from hermes_cli.cli_voice_mixin import CLIVoiceMixin
 from hermes_cli.cli_status_bar_mixin import CLIStatusBarMixin
@@ -2527,7 +2528,7 @@ from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
 _PASTE_REF_RE = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
 
 
-class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
+class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLIDetourMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
     """Interactive REPL for the Hermes Agent."""
 
     # Seeded -q first message (see _should_seed_interactive); run() re-creates
@@ -3489,6 +3490,12 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             if not is_seeded_query:
                 if self.handle_bang_shell(user_input):
                     return
+                # Exact bare-text aliases (config `text_command_aliases`) become the configured
+                # slash command here, before the input can reach the agent.
+                from hermes_cli.text_command_aliases import resolve_text_command_alias
+                _alias_command = resolve_text_command_alias(user_input, self.config)
+                if _alias_command:
+                    user_input = _alias_command
                 if _looks_like_slash_command(user_input):
                     user_input = self._tui_run_slash_input(user_input)
                     if user_input is None:

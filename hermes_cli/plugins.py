@@ -185,11 +185,28 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # pre_platform_message_admission: once per inbound platform message, BEFORE the adapter's own
+    # ingress admission (allowlist, mention gate, dedup claim) and therefore before any MessageEvent
+    # exists — the seam pre_gateway_dispatch cannot reach, since admission drops the message first.
+    # Kwargs: platform, identity (adapter-built, SDK-derived, str/bool/None only), message (raw SDK
+    # object), adapter (the platform adapter handle). CONSUME-ONLY: the single directive is
+    # {"action": "consume", "reason"} -> the adapter stops processing that message entirely.
+    # There is deliberately no allow/admit/rewrite verb: this surface can only REMOVE a message from
+    # the pipeline, never admit one, so it grants no agent, slash or admin authorization to anyone.
+    # Anything else returned (None, a string, a malformed dict) or any exception leaves admission
+    # unchanged. Fired today by the Discord adapter on the live and recovered dispatch paths
+    # (identity["recovered"] distinguishes them). Privacy: identity and the raw message carry user
+    # ids, names and message content.
+    "pre_platform_message_admission",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+# pre_platform_message_admission: a shell hook has no channel for the consume directive, and
+# silently ignoring it would leave a message the plugin believes it owns in the normal agent flow.
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification", "pre_platform_message_admission",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()

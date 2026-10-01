@@ -55,6 +55,10 @@ optional_env:
     description: "Allow any LINE user to talk to the bot (dev only — disables allowlist)"
     prompt: "Allow all users? (true/false)"
     password: false
+  - name: LINE_REQUIRE_MENTION
+    description: "Require an @mention of the bot before group/room messages reach the agent (default: false; overrides gateway.platforms.line.extra.require_mention). 1:1 chats are never gated. Only LINE's native @mention of this bot counts — @All and mentions of other members are ignored."
+    prompt: "Require @mention in groups/rooms? (true/false)"
+    password: false
   - name: LINE_HOME_CHANNEL
     description: "Default user/group/room ID for cron / notification delivery"
     prompt: "Home channel ID (or empty)"

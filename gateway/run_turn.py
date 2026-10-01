@@ -794,7 +794,42 @@ class GatewayTurnMixin:
         )
         _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
 
-    async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
+    def _mark_turn_usage_invalidated(self, _quick_key, run_generation) -> None:
+        """Record that a DETACHED hygiene compaction committed while run ``run_generation`` of
+        ``_quick_key`` was still in flight.
+
+        The released turn is still talking to the provider about the transcript the compaction
+        just replaced, so whatever ``prompt_tokens`` it ends up reporting prices a message list
+        that no longer exists in the DB. ``_hmwa_persist_turn_transcript`` consumes this mark and
+        persists "no real reading" instead, which is the other half of the race that
+        ``_retire_stale_hygiene_usage`` fixes: retiring at the commit is useless if the turn that
+        lost the race finishes afterwards and writes the same stale figure straight back.
+
+        One slot per session key (self-overwriting) and consumed by the marked turn, so an
+        abandoned turn leaves at most one stale int behind per key. In-memory on purpose: an
+        in-flight turn does not survive a restart, so there is nothing durable to protect.
+        """
+        if not _quick_key or run_generation is None:
+            return
+        marks = getattr(self, "_hygiene_invalidated_turn_usage", None)
+        if marks is None:
+            marks = {}
+            self._hygiene_invalidated_turn_usage = marks
+        marks[_quick_key] = int(run_generation)
+
+    def _consume_turn_usage_invalidated(self, _quick_key, run_generation) -> bool:
+        """True (clearing the mark) when THIS run is the one a detached compaction committed under."""
+        marks = getattr(self, "_hygiene_invalidated_turn_usage", None)
+        if not marks or not _quick_key or run_generation is None:
+            return False
+        if marks.get(_quick_key) != int(run_generation):
+            return False
+        del marks[_quick_key]
+        return True
+
+    async def _hmwa_hygiene_on_turn_hold(
+        self, attempt, hs, session_entry, session_key, source, _quick_key=None, run_generation=None,
+    ):
         """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
         notify the user, and re-raise; returns the compressed transcript only when the worker
         was already committing.
@@ -806,7 +841,8 @@ class GatewayTurnMixin:
         every attempt for thinking summary models. Without the fence a late commit could clobber
         newer turns, so cancel."""
         from gateway.run import (
-            _HYGIENE_TURNHOLD_RETRY_SECONDS, _record_hygiene_cooldown, _reset_hygiene_failure_streak
+            _HYGIENE_TURNHOLD_RETRY_SECONDS, _record_hygiene_cooldown, _reset_hygiene_failure_streak,
+            _retire_stale_hygiene_usage,
         )
         fence = attempt.commit_fence
         _hyg_keep_admission = bool(getattr(fence, "commit_watermark_fenced", False)) and not fence.is_cancelled
@@ -816,8 +852,11 @@ class GatewayTurnMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+            _qkey, _rgen = _quick_key, run_generation
 
-            def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
+            def _hyg_adopt_or_space_retry(
+                _fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent, _qkey=_qkey, _rgen=_rgen,
+            ):
                 try:
                     _exc = _fut.exception()
                 except (asyncio.CancelledError, Exception):
@@ -833,6 +872,13 @@ class GatewayTurnMixin:
                         "turn-hold was released — summary adopted at the watermark-fenced "
                         "commit boundary (#97963)", _sid,
                     )
+                    # Deferred twin of the inline adoption reset: the released turn's
+                    # last_prompt_tokens priced the pre-compaction transcript, and the next
+                    # hygiene plan reads it as "actual" before any estimate. Both orderings
+                    # need handling — the turn may already have persisted its reading (retire
+                    # it here) or still be running (mark it, so it does not write it back).
+                    _gw._mark_turn_usage_invalidated(_qkey, _rgen)
+                    _retire_stale_hygiene_usage(_gw, _skey, _sid)
                     try:
                         _reset_hygiene_failure_streak(_gw, _skey)
                     except Exception as _rs_err:
@@ -1197,7 +1243,9 @@ class GatewayTurnMixin:
             try:
                 _compressed = await self._hmwa_hygiene_wait_for_summary(attempt, hs, session_entry)
             except HygieneTurnHoldExceeded:
-                _compressed = await self._hmwa_hygiene_on_turn_hold(attempt, hs, session_entry, session_key, source)
+                _compressed = await self._hmwa_hygiene_on_turn_hold(
+                    attempt, hs, session_entry, session_key, source, _quick_key, run_generation,
+                )
             except asyncio.TimeoutError:
                 _compressed = await self._hmwa_hygiene_on_timeout(attempt, hs, session_entry, session_key, source)
             except BaseException:
@@ -1628,6 +1676,7 @@ class GatewayTurnMixin:
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
+        _quick_key=None, run_generation=None,
     ):
         """Persist this turn to the transcript (session_meta on first turn, user-only on transient
         failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
@@ -1705,8 +1754,15 @@ class GatewayTurnMixin:
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
+        _last_prompt_tokens = agent_result.get("last_prompt_tokens", 0)
+        if self._consume_turn_usage_invalidated(_quick_key, run_generation):
+            # A DETACHED hygiene compaction committed while this turn was still in flight: the
+            # reading prices the transcript that commit replaced, so persist "no real reading"
+            # (the hygiene plan then falls back to the anchor/estimate, both computed against the
+            # live transcript) instead of writing the stale count back over the retirement.
+            _last_prompt_tokens = 0
         await store.update_session(
-            session_entry.session_key, last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            session_entry.session_key, last_prompt_tokens=_last_prompt_tokens,
             touch_activity=not bool(getattr(event, "internal", False)),
         )
 
@@ -2021,6 +2077,7 @@ class GatewayTurnMixin:
                 response=response, agent_failed_early=agent_failed_early,
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
+                _quick_key=_quick_key, run_generation=run_generation,
             )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,

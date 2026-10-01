@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import stat
-import tempfile
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -174,17 +173,45 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     return real_path
 
 
+_TEMP_NAME_ATTEMPTS = 8
+# Same flags ``tempfile.mkstemp`` opens a binary temp file with (O_EXCL is what makes the name
+# claim atomic). Spelled out rather than imported from ``tempfile._bin_openflags``, which is private.
+_TEMP_OPEN_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _create_temp_file(directory: Path, prefix: str, suffix: str) -> "tuple[int, str]":
+    """``mkstemp`` with a bounded name-collision retry and NO retry on permission errors.
+
+    ``tempfile.mkstemp`` retries ``TMP_MAX`` times, and on Windows it swallows every
+    ``PermissionError`` as "a directory with that name already exists" whenever
+    ``os.path.isdir(dir) and os.access(dir, W_OK)``. Windows ``os.access`` only reads the
+    read-only attribute — it never consults the ACL — so a directory the account is denied by
+    ACL answers True and mkstemp spins on a name that can never be created: ``TMP_MAX`` is
+    2**31-1 there (~38k failing ``open`` calls/second measured = days, not a bounded retry).
+    That loop ran inside the process-results receipt write and wedged the gateway event loop.
+    Only a real ``FileExistsError`` is a collision worth another name.
+    """
+    last_exc: OSError | None = None
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        candidate = os.path.join(str(directory), f"{prefix}{os.urandom(8).hex()}{suffix}")
+        try:
+            return os.open(candidate, _TEMP_OPEN_FLAGS, 0o600), candidate
+        except FileExistsError as exc:
+            last_exc = exc
+    raise last_exc
+
+
 def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mode: "int | None" = None, preserve_owner: bool = True) -> None:
     """Temp file + fsync + :func:`atomic_replace`, then re-apply owner/mode.
 
     *write(f)* emits the payload into the open text handle. *mode* is fchmod'd onto the temp fd
-    BEFORE the replace so the target never transits through mkstemp's 0600 (fchmod is Unix-only;
-    the post-replace chmod is the sole path on Windows). The temp file is removed on any failure —
-    ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still clean up.
+    BEFORE the replace so the target never transits through the temp file's 0600 (fchmod is
+    Unix-only; the post-replace chmod is the sole path on Windows). The temp file is removed on any
+    failure — ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still clean up.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     original_owner = _preserve_file_owner(path) if preserve_owner else None
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=prefix, suffix=".tmp")
+    fd, tmp_path = _create_temp_file(path.parent, prefix, ".tmp")
     try:
         with os.fdopen(fd, "w", encoding=encoding) as f:
             if mode is not None and hasattr(os, "fchmod"):

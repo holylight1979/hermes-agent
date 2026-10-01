@@ -134,7 +134,11 @@ def apply_tool_request_middleware(
 
 def run_llm_execution_middleware(
     request: Dict[str, Any], next_call: Callable[[Dict[str, Any]], Any], **context: Any) -> Any:
-    """Run provider execution through registered LLM execution middleware."""
+    """Run provider execution through registered LLM execution middleware.
+
+    A callback raising :class:`MiddlewareAbort` propagates to the caller and the provider is never
+    called; any other callback exception is skipped (fail-open) as before.
+    """
     return _run_execution_chain(
         LLM_EXECUTION_MIDDLEWARE, next_call,
         request=request, original_request=context.pop("original_request", request), **context)
@@ -147,6 +151,17 @@ def run_tool_execution_middleware(
     return _run_execution_chain(
         TOOL_EXECUTION_MIDDLEWARE, next_call,
         tool_name=tool_name, args=args, original_args=context.pop("original_args", args), **context)
+
+
+class MiddlewareAbort(Exception):
+    """Raised by a middleware callback to abort the wrapped operation **fail-closed**.
+
+    Execution middleware normally fails open: a callback that raises is skipped and the request/tool
+    runs unchanged. That is wrong for a callback whose whole job is to change the payload — running
+    the unmodified operation is then a silently different action, not a degraded one. Raising this
+    instead means "do not execute downstream at all": the chain re-raises it to the call site
+    without invoking ``next_call``, through every nested middleware frame.
+    """
 
 
 class _DownstreamExecutionError(Exception):
@@ -200,6 +215,10 @@ def _run_execution_chain(kind: str, terminal_call: Callable[[Any], Any], **kwarg
             return callback(**call_kwargs)
         except _DownstreamExecutionError as exc:
             raise exc.original
+        except MiddlewareAbort:
+            # Explicit fail-closed signal: propagate instead of skipping to the next callback /
+            # terminal call. Must precede the generic handler below.
+            raise
         except Exception as exc:
             logger.warning(
                 "Middleware '%s' callback %s raised: %s",

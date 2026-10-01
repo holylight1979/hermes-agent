@@ -1016,12 +1016,21 @@ class SessionStore(
 
     def update_session(
         self, session_key: str, last_prompt_tokens: int = None, touch_activity: bool = True,
+        expect_session_id: Optional[str] = None,
     ) -> None:
         """Update lightweight session metadata after an interaction; internal turns pass
-        ``touch_activity=False`` so the reset-policy clock does not advance."""
+        ``touch_activity=False`` so the reset-policy clock does not advance.
+
+        ``expect_session_id`` makes the whole update a compare-and-set on the routed session id,
+        checked under ``_lock``: a writer that raced ``/new`` (or an auto-reset, or a hygiene
+        rotation) finds the key rebound to a different session and writes nothing, instead of
+        stamping the previous conversation's token reading onto the fresh one.
+        """
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
+                return
+            if expect_session_id is not None and entry.session_id != expect_session_id:
                 return
             if touch_activity:
                 entry.updated_at = _now()

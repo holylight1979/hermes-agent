@@ -25,7 +25,9 @@ logger = logging.getLogger("hermes_cli.plugins")
 # Allowlist of agent-turn hot-path hooks bounded by plugins.hook_callback_timeout (fail-open:
 # abandon without join — joining reintroduced a shutdown hang). Unlisted hooks run synchronously.
 # Intentionally unbounded: on_session_finalize/reset (last-chance flush — abandon can lose state);
-# subagent_start (observer); pre_gateway_dispatch (policy gate — neither fail mode is acceptable);
+# subagent_start (observer); pre_gateway_dispatch and pre_platform_message_admission (policy gates —
+# neither fail mode is acceptable: abandoning the callback would either leak a message the plugin owns
+# into the agent, or drop one it never claimed);
 # pre/post_approval_* (approval UX has its own timeout); kanban_* (own heartbeat/stale reclaim).
 # The goal is to stop a hung Python plugin callback from wedging the conversation loop (#76821) without
 # joining the worker (avoids the #6622 ThreadPoolExecutor shutdown hang). Hooks not listed below run
