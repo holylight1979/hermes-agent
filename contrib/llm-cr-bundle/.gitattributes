@@ -1,4 +1,4 @@
 # Preserve manifest-verified bytes across Windows/Linux checkouts.
-* -text
+* -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 # Unified diff context markers are required, not source whitespace errors.
 core.patch -whitespace
