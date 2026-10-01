@@ -1,6 +1,6 @@
 {
   "name": "llm-cr-bundle",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "manifest_version": 1,
   "base_commit": "45a6101f36576367359c171cd5820ee76a3d047b",
   "base_commit_note": "core.patch is generated against this upstream commit and is checked with `git apply --check` (and `--reverse --check` for the already-applied case) before anything is written.",
@@ -14,24 +14,23 @@
   ],
   "core_patch": {
     "file": "core.patch",
-    "sha256": "17ec6c39fd8bb6fc90a7d9f34c3a605832022901d02bdf47ef35da456eabee19",
+    "sha256": "1a9502fe118292d2d7e730bd79dbde72059544072c4084e94837d79475f93d12",
     "paths": [
       "cli.py",
       "gateway/run_busy.py",
-      "gateway/slash_commands.py",
-      "gateway/slash_commands_detour.py",
-      "hermes_cli/cli_detour_mixin.py",
-      "hermes_cli/commands.py",
+      "gateway/run_inbound.py",
       "hermes_cli/config.py",
       "hermes_cli/middleware.py",
-      "hermes_cli/session_detour.py",
+      "hermes_cli/plugins.py",
       "hermes_cli/text_command_aliases.py",
-      "tests/cli/test_slash_dispatch_table.py",
+      "tests/fakes/session_detours_plugin.py",
       "tests/gateway/test_detour_commands.py",
+      "tests/gateway/test_detour_plugin_dispatch.py",
       "tests/gateway/test_text_command_alias_deployed_plugin.py",
       "tests/gateway/test_text_command_alias_dispatch.py",
       "tests/gateway/test_text_command_alias_model_switch.py",
       "tests/hermes_cli/test_cli_detour.py",
+      "tests/hermes_cli/test_plugin_command_context.py",
       "tests/hermes_cli/test_session_detour_records.py",
       "tests/hermes_cli/test_text_command_aliases.py"
     ]
@@ -41,6 +40,11 @@
     "plugins/llm-cr-prompt/injector.py": "a0639dd48f6c458b3abe805883c78a3676cf71c15a4f7f0e5cadca1afc864650",
     "plugins/llm-cr-prompt/plugin.yaml": "cfd86b530a8483b70a2cd52a4b3bfc7651078f59773579145950c2897bb8b3b6",
     "plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py": "0db4c91b054e2d649bdd0d5d2486699debaed1c98529fd6a228ad40315623fae",
+    "plugins/session-detours/__init__.py": "ac8ba0ba42f0505c2777893a40d7f5210f70cffffc0e53a325addad6ebeacfb9",
+    "plugins/session-detours/cli_surface.py": "10443fd130f29b7b0515d5105a05b8643870ab5aae31e76dda23bbcfad192b53",
+    "plugins/session-detours/detour_records.py": "020482568c833f2055a10d557b59084c6b7a21535c2e4783d67490fdbb39d6e8",
+    "plugins/session-detours/gateway_surface.py": "96a4f1363565c8bff67ba1adadd12de2f80a692cc300afdcc91b6006c7a50c86",
+    "plugins/session-detours/plugin.yaml": "a85ebccc629c1c6aef019f6a4485c11feb449ab37342f759f75d697df4d461af",
     "plugins/text-command-aliases/__init__.py": "e35eb5c8fdc560f47b7ab74f853d3b476d8c82307cc7dba8176ade800115611a",
     "plugins/text-command-aliases/plugin.yaml": "3f974b1fd6890ca4c1a908beb8b39dd5730d455c16cf174b4d7f0c99e95fbff3"
   },
@@ -51,9 +55,11 @@
       "contains": [
         "def _hm_pre_gateway_dispatch_hook",
         "_action == \"rewrite\"",
-        "allow_gateway_control"
+        "allow_gateway_control",
+        "_hm_dispatch_quick_and_plugin_commands",
+        "get_plugin_command_handler"
       ],
-      "why": "the text-command-aliases plugin rewrites event.text through this existing hook seam; without the rewrite directive the alias would silently never fire"
+      "why": "the text-command-aliases plugin rewrites event.text through this existing hook seam; without the rewrite directive the alias would silently never fire. The last two are the plugin-command dispatch sink the patch extends with a host context and a normalized-name access gate"
     },
     {
       "file": "hermes_cli/plugins.py",
@@ -61,9 +67,28 @@
         "\"pre_gateway_dispatch\"",
         "def register_middleware",
         "def register_hook",
-        "def get_config"
+        "def get_config",
+        "def register_command",
+        "_plugin_commands"
       ],
-      "why": "both plugins register through these loader APIs and read their own settings subtree"
+      "why": "the three plugins register through these loader APIs and read their own settings subtree; session-detours registers slash commands, so the patch extends register_command (busy_policy) and the command table the surfaces read"
+    },
+    {
+      "file": "cli.py",
+      "contains": [
+        "def _run_plugin_slash_command",
+        "resolve_plugin_command_result"
+      ],
+      "why": "the CLI leg of a plugin slash command is dispatched here; the patch binds the host context onto this call, which is what lets session-detours compose native session commands from outside core"
+    },
+    {
+      "file": "gateway/run_busy.py",
+      "contains": [
+        "def _dispatch_busy_slash_command",
+        "def _check_slash_access",
+        "can't run "
+      ],
+      "why": "the patch factors the built-in busy refusal text out of this mixin so a plugin command that declared busy_policy=\"reject\" is refused mid-turn in exactly the same words, and reuses this access gate for it"
     },
     {
       "file": "hermes_cli/middleware.py",
@@ -97,14 +122,14 @@
       "contains": [
         "def atomic_json_write"
       ],
-      "why": "session_detour writes its durable return records through this"
+      "why": "the session-detours plugin writes its durable return records through this"
     },
     {
       "file": "hermes_cli/profiles.py",
       "contains": [
         "def get_active_profile_name"
       ],
-      "why": "session_detour labels a record with its profile"
+      "why": "the session-detours plugin labels a record with its profile"
     },
     {
       "file": "hermes_constants.py",
@@ -118,7 +143,7 @@
       "contains": [
         "def parse_model_switch_args"
       ],
-      "why": "the detour route parser reuses the one /model parser, including its flag conflicts"
+      "why": "the plugin's detour route parser reuses the one /model parser, including its flag conflicts"
     },
     {
       "file": "gateway/slash_commands_session.py",
@@ -138,9 +163,10 @@
     {
       "file": "gateway/run.py",
       "contains": [
-        "def _session_key_for_source"
+        "def _session_key_for_source",
+        "def _normalize_source_for_session_key"
       ],
-      "why": "the gateway detour lane key is the native session key for the source"
+      "why": "the gateway detour lane key is the native session key for the source, resolved through the same source normalization the turn itself uses"
     },
     {
       "file": "hermes_cli/cli_session_mixin.py",
@@ -162,36 +188,29 @@
         "def _handle_model_switch"
       ],
       "why": "the CLI detour applies its route through the native model switch"
-    },
-    {
-      "file": "hermes_cli/commands.py",
-      "contains": [
-        "COMMAND_REGISTRY",
-        "CommandDef("
-      ],
-      "why": "the patch registers /detour and /detour-end in this central registry; the CLI reaches them via the _handle_<name>_command naming-convention fallback"
     }
   ],
   "tests": {
     "in_repo": [
       "tests/hermes_cli/test_text_command_aliases.py",
+      "tests/hermes_cli/test_plugin_command_context.py",
       "tests/hermes_cli/test_session_detour_records.py",
       "tests/hermes_cli/test_cli_detour.py",
       "tests/gateway/test_text_command_alias_dispatch.py",
       "tests/gateway/test_text_command_alias_model_switch.py",
       "tests/gateway/test_text_command_alias_deployed_plugin.py",
       "tests/gateway/test_detour_commands.py",
-      "tests/cli/test_slash_dispatch_table.py"
+      "tests/gateway/test_detour_plugin_dispatch.py"
     ],
     "in_home": [
       "plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py"
     ]
   },
   "bundle_files": {
-    "README.md": "0cf80eb57aa0c451ee984ca1e59d8542dfa6e32897a39cd0814c2a07fd388674",
-    "install.py": "c828cd61baf636a3153df69b5984a6e6e8c8cc99b0a33bc9b42f450b3e7d56ab",
-    "build.py": "e8f1539c3ea2134cbb434e62221ebc1d0465a2ebd0f0cad8ca1f34e0a9b8200d",
-    "core.patch": "17ec6c39fd8bb6fc90a7d9f34c3a605832022901d02bdf47ef35da456eabee19",
-    "docs/SKILL.md": "738fa7e0955b47dd8045191570337871f55c25e77eccf0b2256d2c380801d610"
+    "README.md": "af817c5c2087427531e800eaadaa30ab9ef90b44d052d693544b5979797cdc9d",
+    "install.py": "5e8be1c6d4d05a94bed54ddce04b48064ec22f048596bade41886342d6edb46c",
+    "build.py": "a094b48e02a02d03d8beec383a581f87003e56f59566a365e4b5b4a25bb8d9fd",
+    "core.patch": "1a9502fe118292d2d7e730bd79dbde72059544072c4084e94837d79475f93d12",
+    "docs/SKILL.md": "fff5b52a9e21d01ce3935839717c7c1853e00bfcdb8dd392cd9173dbc284931d"
   }
 }

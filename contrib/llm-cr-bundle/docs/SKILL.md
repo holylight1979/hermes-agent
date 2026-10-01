@@ -1,7 +1,7 @@
 ---
 name: llm-crack-talk
 description: "Use when maintaining llm-cr native session model switching. Runtime intercepts the exact bare text llm-cr / llm-cr-end before any LLM, uses native session-scoped model commands and program-generated confirmations. There is no model-to-script relay; never invoke one as a fallback."
-version: 3.1.0
+version: 4.0.0
 metadata:
   hermes:
     tags: [native-model-switch, session-detour, prompt-injection]
@@ -20,9 +20,10 @@ metadata:
 
 Only the exact whole-message text (surrounding whitespace allowed) is a control command:
 
-- `llm-cr`: create a fresh child session via native `/detour`, with a durable return record, then
-  switch to `<cr-provider>` / `<cr-model>`. The parent transcript is never carried into the child.
-- `llm-cr-end`: native `/detour-end` resumes the recorded parent transcript and restores
+- `llm-cr`: create a fresh child session via `/detour` (a plugin command composed of the surface's
+  own native session commands), with a durable return record, then switch to `<cr-provider>` /
+  `<cr-model>`. The parent transcript is never carried into the child.
+- `llm-cr-end`: `/detour-end` resumes the recorded parent transcript and restores
   `<exit-provider>` / `<exit-model>`. The child transcript is never merged into the parent; the
   child remains archived, never deleted.
 
@@ -45,10 +46,24 @@ manual `/new` or `/resume` must not silently consume an outstanding return recor
 - **Gateway**: the `text-command-aliases` plugin registers the existing `pre_gateway_dispatch` hook
   and rewrites only exact triggers on events that already carry `allow_gateway_control`. Auth,
   mention gates, slash authorization and busy handling all stay authoritative and run afterwards.
-- **Lifecycle**: `hermes_cli/session_detour.py` (atomic scoped UTF-8 JSON records under
-  `$HERMES_HOME/session-detours/`, a per-lane transition lock in two layers), plus
-  `hermes_cli/cli_detour_mixin.py` and `gateway/slash_commands_detour.py`, which compose the native
-  reset/resume handlers rather than reimplementing session rotation.
+- **`/detour` is a plugin command, not a built-in.** The whole feature lives in the
+  `session-detours` plugin at `$HERMES_HOME/plugins/session-detours/`: `detour_records.py` (atomic
+  scoped UTF-8 JSON records under `$HERMES_HOME/session-detours/`, a per-lane transition lock in two
+  layers), `cli_surface.py` and `gateway_surface.py`, which compose the native reset/resume handlers
+  rather than reimplementing session rotation. Core's command registry does not know these names; if
+  `/detour` ever appears there, that is a stale pre-plugin install.
+- **How a plugin reaches native session behavior**: `register_command` handlers that declare a
+  `context` parameter receive the dispatching surface's host (`hermes_cli.plugins.
+  bind_plugin_command_context` — `{surface, command, host, session_key, event, source}`). Each
+  surface module is bound to the live `HermesCLI` / `GatewayRunner` through a per-host adapter that
+  delegates unknown attributes to the host, so no host class is patched and the mixins keep calling
+  native commands. No host context ⇒ the command refuses; it never guesses a session.
+- Both commands register `busy_policy="reject"`, so mid-run they are refused in the same words as a
+  built-in `CommandDef(busy_policy="reject")`, on both the busy fast path and the access gate (which
+  is checked against the normalized name, so `/detour_end` is gated identically).
+- **Disabled plugin ⇒ no command at all**: `/detour` disappears from completion and from gateway and
+  CLI dispatch, the `llm-cr` alias resolves to a command nothing handles, and every native handler is
+  untouched.
 - **Record lookup** validates lane, owner and current child; repeated entry is refused; a return
   record is consumed only after the restoration and route are verified against live runtime state.
 - Record contents: `{model, provider}` per side, the two session ids, status, profile label,

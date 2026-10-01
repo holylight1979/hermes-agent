@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from hermes_cli.session_detour import (
+from tests.fakes.session_detours_plugin import detour_cli
+from tests.fakes.session_detours_plugin import (
     STATUS_ACTIVE,
     STATUS_RETURNED,
     DetourScope,
@@ -91,6 +93,26 @@ def _isolated_home(tmp_path, monkeypatch):
 
     os.environ.pop("HERMES_SESSION_ID", None)
     _VAR_MAP["HERMES_SESSION_ID"].set(_UNSET)
+
+
+@pytest.fixture
+def installed_plugin(_isolated_home):
+    """The ``session-detours`` plugin really installed into this temp home and discovered."""
+    from tests.fakes import session_detours_plugin as sdp
+
+    manager = sdp.install_into_home(_isolated_home)
+    yield manager
+    sdp.reset_discovery()
+
+
+@pytest.fixture
+def disabled_plugin(_isolated_home):
+    """The plugin on disk but NOT consented — the "feature off" state."""
+    from tests.fakes import session_detours_plugin as sdp
+
+    manager = sdp.install_into_home(_isolated_home, enabled=False)
+    yield manager
+    sdp.reset_discovery()
 
 
 @pytest.fixture
@@ -168,7 +190,8 @@ def _scope(parent_session_id: str) -> DetourScope:
     """The lane a CLI detour from *parent_session_id* belongs to, recomputed the way production does
     (``_os_user`` degrades to ``""`` when the environment names no user — as it does under the
     hermetic test env — which is a scope component, not an identity check)."""
-    from hermes_cli.cli_detour_mixin import _os_user
+    from tests.fakes.session_detours_plugin import plugin as _sdp
+    from hermes_session_detours_plugin.cli_surface import _os_user  # noqa: F401
 
     return DetourScope(surface="cli", channel="local", owner=_os_user(), lane=parent_session_id)
 
@@ -195,7 +218,7 @@ def test_detour_rotates_to_a_fresh_child_session_and_records_the_way_back(db):
     parent = _new_session_id("par001")
     cli = _make_cli(db, parent, texts=("hello parent",))
 
-    cli._handle_detour_command("/detour child-model --provider child-provider")
+    detour_cli(cli)._handle_detour_command("/detour child-model --provider child-provider")
 
     child = cli.session_id
     assert child and child != parent
@@ -217,7 +240,7 @@ def test_the_parent_session_is_preserved_with_its_own_transcript(db):
     parent = _new_session_id("par002")
     cli = _make_cli(db, parent, texts=("hello parent", "parent reply"))
 
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     row = db.get_session(parent)
     assert row is not None  # ended, not deleted
@@ -228,7 +251,7 @@ def test_a_bare_detour_switches_no_model_at_all(db):
     parent = _new_session_id("par003")
     cli = _make_cli(db, parent, texts=("hello parent",))
 
-    cli._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_command("/detour")
 
     assert cli.session_id != parent
     assert cli.applied_routes == []
@@ -237,8 +260,13 @@ def test_a_bare_detour_switches_no_model_at_all(db):
     assert read_record(_scope(parent)).status == STATUS_ACTIVE
 
 
-def test_detour_is_reachable_through_the_real_slash_dispatch_and_bare_alias(db):
-    """Ingress: the configured bare alias resolves to ``/detour ...`` and the CLI dispatches it."""
+def test_detour_is_reachable_through_the_real_slash_dispatch_and_bare_alias(db, installed_plugin):
+    """Ingress, end to end: bare alias -> ``/detour ...`` -> the CLI's own plugin-command dispatch.
+
+    Nothing here knows the feature lives in a plugin. ``process_command`` resolves ``/detour``
+    through the same path any unregistered slash command takes (``_process_unregistered_slash`` ->
+    ``_run_plugin_slash_command``), which binds this CLI as the handler's host context.
+    """
     from hermes_cli.text_command_aliases import resolve_text_command_alias
 
     parent = _new_session_id("par004")
@@ -248,8 +276,12 @@ def test_detour_is_reachable_through_the_real_slash_dispatch_and_bare_alias(db):
         "aliases": {"llm-cr": "/detour child-model --provider child-provider",
                     "llm-cr-end": "/detour-end back-model --provider back-provider"}}}
 
-    assert cli._slash_handler("detour") == ("_handle_detour_command", True)
-    assert cli._slash_handler("detour-end") == ("_handle_detour_end_command", True)
+    # /detour is no longer a built-in: it resolves only because the plugin registered it.
+    from hermes_cli.commands import resolve_command
+    assert resolve_command("detour") is None
+    assert cli._slash_handler("detour") is None
+    from cli import _get_plugin_cmd_handler_names
+    assert {"detour", "detour-end"} <= _get_plugin_cmd_handler_names()
 
     command = resolve_text_command_alias("llm-cr", cli.config)
     assert command == "/detour child-model --provider child-provider"
@@ -269,12 +301,12 @@ def test_detour_is_reachable_through_the_real_slash_dispatch_and_bare_alias(db):
 def test_detour_end_restores_the_parents_own_history_and_route(db):
     parent = _new_session_id("par005")
     cli = _make_cli(db, parent, texts=("hello parent", "parent reply"))
-    cli._handle_detour_command("/detour child-model --provider child-provider")
+    detour_cli(cli)._handle_detour_command("/detour child-model --provider child-provider")
     child = cli.session_id
     db.append_message(child, role="user", content="child only")
     cli.conversation_history = [{"role": "user", "content": "child only"}]
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     assert cli.session_id == parent
     # The actual transcript came back, loaded from the parent's own rows.
@@ -293,9 +325,9 @@ def test_detour_end_restores_the_parents_own_history_and_route(db):
 def test_detour_end_prefers_an_explicit_route_over_the_recorded_one(db):
     parent = _new_session_id("par006")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
-    cli._handle_detour_end_command("/detour-end back-model --provider back-provider")
+    detour_cli(cli)._handle_detour_end_command("/detour-end back-model --provider back-provider")
 
     assert cli.session_id == parent
     assert _texts(cli) == ["hello parent"]
@@ -305,12 +337,12 @@ def test_detour_end_prefers_an_explicit_route_over_the_recorded_one(db):
 def test_neither_transcript_ever_crosses_the_boundary(db):
     parent = _new_session_id("par007")
     cli = _make_cli(db, parent, texts=("parent secret",))
-    cli._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_command("/detour")
     child = cli.session_id
     db.append_message(child, role="user", content="child secret")
     cli.conversation_history = [{"role": "user", "content": "child secret"}]
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     assert _db_texts(db, parent) == ["parent secret"]
     assert _db_texts(db, child) == ["child secret"]
@@ -320,11 +352,11 @@ def test_neither_transcript_ever_crosses_the_boundary(db):
 def test_a_second_detour_end_is_a_quiet_no_op(db, capsys):
     parent = _new_session_id("par008")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour")
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
     capsys.readouterr()
 
-    cli._handle_detour_end_command("/detour-end back-model")
+    detour_cli(cli)._handle_detour_end_command("/detour-end back-model")
 
     assert "Nothing to end" in capsys.readouterr().out
     assert cli.session_id == parent
@@ -337,7 +369,7 @@ def test_detour_end_without_any_detour_creates_nothing(db, capsys, _isolated_hom
     cli = _make_cli(db, parent, texts=("hello parent",))
     before = _session_ids(_isolated_home)
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     assert "Nothing to end" in capsys.readouterr().out
     assert cli.session_id == parent
@@ -351,12 +383,12 @@ def test_a_second_detour_neither_nests_nor_overwrites_the_record(db, capsys, _is
     the current session belongs to — not at the lane a new detour would create, which is empty."""
     parent = _new_session_id("par010")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
     child, before = cli.session_id, record_path(_scope(parent)).read_bytes()
     sessions_before = _session_ids(_isolated_home)
     capsys.readouterr()
 
-    cli._handle_detour_command("/detour other-model")
+    detour_cli(cli)._handle_detour_command("/detour other-model")
 
     assert "already open" in capsys.readouterr().out
     assert cli.session_id == child  # no second rotation
@@ -366,7 +398,7 @@ def test_a_second_detour_neither_nests_nor_overwrites_the_record(db, capsys, _is
     assert "/model other-model --session" not in cli.applied_routes
 
     # The one detour that IS open is still returnable.
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
     assert cli.session_id == parent
     assert _texts(cli) == ["hello parent"]
 
@@ -378,7 +410,7 @@ def test_a_detour_from_an_empty_parent_is_still_returnable(db):
     cli = _make_cli(db, parent)  # no transcript at all
     assert db.get_session(parent) is not None
 
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     child = cli.session_id
     assert child != parent
@@ -386,7 +418,7 @@ def test_a_detour_from_an_empty_parent_is_still_returnable(db):
     assert db.get_session(parent) is not None
     assert read_record(_scope(parent)).parent_session_id == parent
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     assert cli.session_id == parent
     assert cli.conversation_history == []
@@ -399,8 +431,8 @@ def test_two_concurrent_cli_sessions_detour_and_return_independently(db):
     first = _make_cli(db, first_parent, texts=("first parent",))
     second = _make_cli(db, second_parent, texts=("second parent",))
 
-    first._handle_detour_command("/detour first-child-model")
-    second._handle_detour_command("/detour second-child-model")
+    detour_cli(first)._handle_detour_command("/detour first-child-model")
+    detour_cli(second)._handle_detour_command("/detour second-child-model")
     first_child, second_child = first.session_id, second.session_id
 
     # Two lanes, two records, neither visible to the other.
@@ -410,26 +442,26 @@ def test_two_concurrent_cli_sessions_detour_and_return_independently(db):
     assert first_child != second_child
 
     # Ending the second one must not touch the first.
-    second._handle_detour_end_command("/detour-end")
+    detour_cli(second)._handle_detour_end_command("/detour-end")
     assert second.session_id == second_parent
     assert _texts(second) == ["second parent"]
     assert first.session_id == first_child
     assert read_record(_scope(first_parent)).status == STATUS_ACTIVE
 
-    first._handle_detour_end_command("/detour-end")
+    detour_cli(first)._handle_detour_end_command("/detour-end")
     assert first.session_id == first_parent
     assert _texts(first) == ["first parent"]
 
 
 def test_a_gateway_record_is_not_usable_from_the_cli_lane(db, capsys):
-    from hermes_cli.session_detour import begin_detour
+    from tests.fakes.session_detours_plugin import begin_detour
 
     parent = _new_session_id("par012")
     cli = _make_cli(db, parent, texts=("hello parent",))
     begin_detour(DetourScope(surface="gateway", channel="telegram:c1", owner="u1", lane="k1"),
                  parent_session_id=parent)
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     assert "Nothing to end" in capsys.readouterr().out
     assert cli.session_id == parent
@@ -440,16 +472,16 @@ def test_a_detour_survives_a_cli_restart_and_still_returns(db):
     """A second CLI process has no in-memory handle; the child→lane index is what finds the record."""
     parent = _new_session_id("par013")
     cli = _make_cli(db, parent, texts=("hello parent", "parent reply"))
-    cli._handle_detour_command("/detour child-model --provider child-provider")
+    detour_cli(cli)._handle_detour_command("/detour child-model --provider child-provider")
     child = cli.session_id
 
     # "Restart": a brand-new CLI object on a brand-new session, nothing inherited from memory.
     fresh = _make_cli(db, _new_session_id("par014"))
-    assert fresh._detour_open_scope is None
+    assert detour_cli(fresh)._detour_open_scope is None
     fresh._handle_resume_command(f"/resume {child}")
     assert fresh.session_id == child
 
-    fresh._handle_detour_end_command("/detour-end")
+    detour_cli(fresh)._handle_detour_end_command("/detour-end")
 
     assert fresh.session_id == parent
     assert _texts(fresh) == ["hello parent", "parent reply"]
@@ -466,7 +498,7 @@ def test_a_route_that_cannot_be_applied_rolls_the_whole_enter_leg_back(db, capsy
         raise RuntimeError("provider unreachable")
 
     cli._handle_model_switch = _boom
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     out = capsys.readouterr().out
     assert "Detour not started" in out and "model switch" in out
@@ -481,7 +513,7 @@ def test_a_switch_that_reports_success_but_changes_nothing_is_treated_as_failure
     cli = _make_cli(db, parent, texts=("hello parent",))
     cli.model_switch_is_broken = True
 
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     assert "Detour not started" in capsys.readouterr().out
     assert cli.session_id == parent
@@ -497,7 +529,7 @@ def test_a_failed_native_reset_leaves_the_lane_untouched(db, capsys, monkeypatch
         raise RuntimeError("reset exploded")
 
     monkeypatch.setattr(cli, "new_session", _boom)
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     assert "Detour not started" in capsys.readouterr().out
     assert cli.session_id == parent
@@ -508,12 +540,12 @@ def test_a_failed_native_reset_leaves_the_lane_untouched(db, capsys, monkeypatch
 def test_a_failed_resume_keeps_the_detour_open(db, capsys, monkeypatch):
     parent = _new_session_id("par018")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_command("/detour")
     child = cli.session_id
     capsys.readouterr()
 
     monkeypatch.setattr(cli, "_handle_resume_command", lambda _cmd: None)  # refuses, quietly
-    cli._handle_detour_end_command("/detour-end back-model")
+    detour_cli(cli)._handle_detour_end_command("/detour-end back-model")
 
     assert "Could not return" in capsys.readouterr().out
     assert cli.session_id == child
@@ -524,12 +556,12 @@ def test_a_failed_resume_keeps_the_detour_open(db, capsys, monkeypatch):
 def test_a_deleted_parent_session_refuses_the_return_and_keeps_the_record(db, capsys, _isolated_home):
     parent = _new_session_id("par019")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_command("/detour")
     child = cli.session_id
     db.delete_session(parent, sessions_dir=_isolated_home / "sessions")
     capsys.readouterr()
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     out = capsys.readouterr().out
     assert "no longer exists" in out
@@ -541,13 +573,13 @@ def test_a_deleted_parent_session_refuses_the_return_and_keeps_the_record(db, ca
 def test_an_unusable_record_refuses_the_return_and_is_preserved(db, capsys, payload):
     parent = _new_session_id("par020")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_command("/detour")
     child = cli.session_id
     path = record_path(_scope(parent))
     path.write_bytes(payload)
     capsys.readouterr()
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     assert "Could not end the detour" in capsys.readouterr().out
     assert cli.session_id == child  # fail closed: no switch, no new session
@@ -558,13 +590,13 @@ def test_an_unwritable_record_directory_refuses_the_enter_leg(db, capsys, monkey
     parent = _new_session_id("par021")
     cli = _make_cli(db, parent, texts=("hello parent",))
 
-    import hermes_cli.session_detour as detour_mod
+    from tests.fakes.session_detours_plugin import records as detour_mod
 
     def _boom(*_a, **_kw):
         raise OSError("read-only filesystem")
 
     monkeypatch.setattr(detour_mod, "write_record", _boom)
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     assert "could not be written" in capsys.readouterr().out
     assert cli.session_id == parent  # never rotated
@@ -578,7 +610,7 @@ def _break_the_lane_lock(monkeypatch):
     Returns the switch, so a test can let the platform cooperate again without ``monkeypatch.undo``
     (which would also undo the autouse home fixture's patches).
     """
-    import hermes_cli.session_detour as detour_mod
+    from tests.fakes.session_detours_plugin import records as detour_mod
 
     broken = {"on": True}
     real_flock = detour_mod._flock
@@ -601,7 +633,7 @@ def test_a_lane_that_cannot_be_locked_refuses_the_enter_leg_and_changes_nothing(
     rows_before = _session_ids(_isolated_home)
     _break_the_lane_lock(monkeypatch)
 
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     out = capsys.readouterr().out
     assert "Detour not started" in out and "could not be locked" in out
@@ -618,12 +650,12 @@ def test_a_lane_that_cannot_be_locked_refuses_the_return_leg_and_keeps_the_detou
     """The open detour is left exactly as it was, so the return stays retryable."""
     parent = _new_session_id("par024")
     cli = _make_cli(db, parent, texts=("hello parent",))
-    cli._handle_detour_command("/detour")
+    detour_cli(cli)._handle_detour_command("/detour")
     child = cli.session_id
     capsys.readouterr()
     _break_the_lane_lock(monkeypatch)
 
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
 
     out = capsys.readouterr().out
     assert "Could not end the detour" in out and "could not be locked" in out
@@ -636,12 +668,12 @@ def test_a_detour_refused_by_the_lock_succeeds_on_the_next_try(db, capsys, monke
     parent = _new_session_id("par025")
     cli = _make_cli(db, parent, texts=("hello parent",))
     broken = _break_the_lane_lock(monkeypatch)
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
     assert cli.session_id == parent
     capsys.readouterr()
 
     broken["on"] = False  # the platform cooperates again
-    cli._handle_detour_command("/detour child-model")
+    detour_cli(cli)._handle_detour_command("/detour child-model")
 
     child = cli.session_id
     assert child and child != parent
@@ -651,7 +683,7 @@ def test_a_detour_refused_by_the_lock_succeeds_on_the_next_try(db, capsys, monke
 
     # ...and so does the return leg that was refused a moment earlier.
     capsys.readouterr()
-    cli._handle_detour_end_command("/detour-end")
+    detour_cli(cli)._handle_detour_end_command("/detour-end")
     assert cli.session_id == parent
     assert read_record(_scope(parent)).status == STATUS_RETURNED
 
@@ -661,9 +693,117 @@ def test_a_route_that_would_outlive_the_detour_is_refused_before_anything_happen
     parent = _new_session_id("par022")
     cli = _make_cli(db, parent, texts=("hello parent",))
 
-    cli._handle_detour_command(f"/detour {args}")
+    detour_cli(cli)._handle_detour_command(f"/detour {args}")
 
     assert capsys.readouterr().out.strip().startswith("✗")
     assert cli.session_id == parent
     assert not record_path(_scope(parent)).exists()
     assert cli.applied_routes == []
+
+
+# ------------------------------------------------------------------- the feature switched off
+def test_a_disabled_plugin_leaves_no_detour_command_on_the_cli(db, capsys, disabled_plugin):
+    """Plugin on disk but not consented: ``/detour`` is simply not a command this CLI has."""
+    from cli import _get_plugin_cmd_handler_names
+
+    parent = _new_session_id("par023")
+    cli = _make_cli(db, parent, texts=("hello parent",))
+    before = _session_ids(_isolated_home_path(cli))
+
+    assert "detour" not in _get_plugin_cmd_handler_names()
+    assert cli._slash_handler("detour") is None
+
+    # Consumed by the CLI (True), never handed to the agent as a prompt.
+    assert cli.process_command("/detour child-model") is True
+
+    out = capsys.readouterr().out
+    assert "Unknown command: /detour" in out
+    assert cli.session_id == parent
+    assert _session_ids(_isolated_home_path(cli)) == before
+    assert not record_path(_scope(parent)).exists()
+    assert cli.applied_routes == []
+
+
+def test_a_bare_alias_for_a_disabled_detour_fails_loudly_instead_of_becoming_a_prompt(
+    db, capsys, disabled_plugin,
+):
+    """``llm-cr`` still rewrites to ``/detour``; with the feature off the user must SEE that.
+
+    The failure mode this guards against is the quiet one: the rewritten slash command falls
+    through as ordinary text and the model answers as if a detour had happened.
+    """
+    from hermes_cli.text_command_aliases import resolve_text_command_alias
+
+    parent = _new_session_id("par024")
+    cli = _make_cli(db, parent, texts=("hello parent",))
+    cli.config = {"text_command_aliases": {
+        "enabled": True,
+        "aliases": {"llm-cr": "/detour child-model --provider child-provider"}}}
+
+    command = resolve_text_command_alias("llm-cr", cli.config)
+    assert command == "/detour child-model --provider child-provider"
+
+    # True == "the CLI handled this input"; it is never forwarded to the agent.
+    assert cli.process_command(command) is True
+    assert "Unknown command: /detour" in capsys.readouterr().out
+    assert cli.session_id == parent
+
+
+def test_the_native_session_commands_are_still_the_clis_own(installed_plugin):
+    """The plugin composes ``/new`` and ``/resume``; it must not have replaced or wrapped either."""
+    import cli as cli_mod
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+    from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+    from hermes_cli.cli_session_mixin import CLISessionMixin
+    from hermes_cli.commands import resolve_command
+
+    # Each of the three natives the detour composes still resolves to its own core mixin — not to
+    # a plugin module, and not to anything wrapped around one.
+    for name, owner in (("new_session", CLISessionMixin),
+                        ("_handle_resume_command", CLICommandsMixin),
+                        ("_handle_model_switch", CLIModelSwitchMixin)):
+        assert getattr(cli_mod.HermesCLI, name) is getattr(owner, name), name
+    # No detour mixin is in the CLI's MRO any more.
+    assert not any("Detour" in klass.__name__ for klass in cli_mod.HermesCLI.__mro__)
+    # /new and /resume are still registry built-ins; /detour and /detour-end are not.
+    assert resolve_command("new") is not None and resolve_command("resume") is not None
+    assert resolve_command("detour") is None and resolve_command("detour-end") is None
+
+
+def test_a_context_taking_handler_with_no_host_refuses_instead_of_guessing(_isolated_home):
+    """A surface that cannot supply a session host must get a refusal, not a rotated session."""
+    from tests.fakes.session_detours_plugin import dispatch_detour, dispatch_detour_end
+
+    for dispatch, name in ((dispatch_detour, "detour"), (dispatch_detour_end, "detour-end")):
+        for context in (None, {}, {"surface": "tui"}, {"surface": "cli", "host": None}):
+            reply = dispatch("child-model", context=context)
+            assert isinstance(reply, str) and reply.startswith("❌"), (name, context)
+            assert f"/{name}" in reply
+    # A gateway context with no event is equally refused: there is no lane to act on.
+    assert dispatch_detour("", context={"surface": "gateway", "host": object()}).startswith("❌")
+
+
+def test_the_per_host_adapter_cache_does_not_retain_disposable_clis(db):
+    """Each CLI gets its own adapter, and a finished CLI is not pinned by the plugin."""
+    import gc
+    import weakref
+
+    from tests.fakes.session_detours_plugin import plugin as sdp
+
+    first = _make_cli(db, _new_session_id("par025"))
+    second = _make_cli(db, _new_session_id("par026"))
+
+    # Same host → the same adapter, which is what carries the open scope between the two legs.
+    assert sdp._cli_adapter(first) is sdp._cli_adapter(first)
+    assert sdp._cli_adapter(first) is not sdp._cli_adapter(second)
+
+    gone = weakref.ref(second)
+    assert sdp._cli_adapter(second) is not None
+    del second
+    gc.collect()
+    assert gone() is None, "the adapter cache is still holding the finished CLI"
+
+
+def _isolated_home_path(_cli):
+    """The temp home this test's CLI is running under."""
+    return Path(os.environ["HERMES_HOME"])

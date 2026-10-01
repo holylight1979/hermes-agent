@@ -1,4 +1,4 @@
-"""Return-record contracts for ``/detour`` / ``/detour-end`` (hermes_cli/session_detour.py).
+"""Return-record contracts for ``/detour`` / ``/detour-end`` (the ``session-detours`` plugin's ``detour_records``).
 
 These exercise the real store against a temp home: no surface, no sessions, just the durable
 state that makes the return leg possible and the gates that stop it from being abused.
@@ -10,7 +10,7 @@ import threading
 
 import pytest
 
-from hermes_cli.session_detour import (
+from tests.fakes.session_detours_plugin import (
     LOCK_REFUSAL,
     RECORD_VERSION,
     STATUS_ACTIVE,
@@ -308,7 +308,7 @@ def test_the_lane_lock_serializes_read_decide_write(home):
 
 def _unlockable(monkeypatch):
     """Make the advisory lock unobtainable, the way a platform without it would."""
-    import hermes_cli.session_detour as sd
+    from tests.fakes.session_detours_plugin import records as sd
 
     monkeypatch.setattr(sd, "_flock", lambda *a, **k: (_ for _ in ()).throw(OSError("unsupported")))
     return sd
@@ -370,7 +370,7 @@ def test_a_lock_that_fails_after_the_file_is_open_closes_the_handle(home, monkey
 def test_a_refused_lock_leaves_the_lane_acquirable_again(home, monkeypatch):
     """The in-process mutex is released on the failure path, so a retry is a normal acquisition —
     a refused command must not wedge the lane."""
-    import hermes_cli.session_detour as sd
+    from tests.fakes.session_detours_plugin import records as sd
 
     calls = []
     real_flock = sd._flock
@@ -436,3 +436,81 @@ def test_record_directory_is_created_on_demand(home):
     begin_detour(_scope(), parent_session_id="20260101_000000_aaa")
     assert detour_root(home).is_dir()
     assert os.path.isfile(record_path(_scope()))
+
+
+# ------------------------------------------------------- records written before the plugin move
+#: A record exactly as the pre-plugin core module (``hermes_cli/session_detour.py``) wrote it.
+#: Byte-for-byte: the move to ``contrib/.../session-detours/detour_records.py`` changed no line of
+#: that module, so a user upgrading mid-detour must find their way back, not an error.
+LEGACY_RECORD_JSON = """{
+  "version": 1,
+  "status": "active",
+  "profile": "default",
+  "scope": {
+    "surface": "gateway",
+    "channel": "discord:chan1",
+    "owner": "user1",
+    "lane": "key1"
+  },
+  "parent_session_id": "20260101_000000_aaa",
+  "child_session_id": "20260101_000100_bbb",
+  "parent_route": {
+    "model": "parent-model",
+    "provider": "parent-provider"
+  },
+  "child_route": {
+    "model": "child-model",
+    "provider": "child-provider"
+  },
+  "entered_at": "2026-01-01T00:01:00+00:00",
+  "returned_at": "",
+  "token": "legacytoken0001"
+}"""
+
+
+def _write_legacy_record(home, scope) -> None:
+    path = record_path(scope, home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(LEGACY_RECORD_JSON, encoding="utf-8")
+
+
+def test_a_record_written_before_the_plugin_move_is_still_read(home):
+    scope = _scope()
+    _write_legacy_record(home, scope)
+
+    record = read_record(scope)
+
+    assert record is not None
+    assert record.version == RECORD_VERSION  # no schema churn across the move
+    assert (record.status, record.parent_session_id, record.child_session_id) == (
+        STATUS_ACTIVE, "20260101_000000_aaa", "20260101_000100_bbb")
+    assert record.parent_route == {"model": "parent-model", "provider": "parent-provider"}
+    assert record.token == "legacytoken0001"
+
+
+def test_an_in_flight_detour_from_before_the_move_still_resolves_its_return_target(home):
+    """The point of the compatibility: a user mid-detour at upgrade time can still come back."""
+    scope = _scope()
+    _write_legacy_record(home, scope)
+
+    record = read_record(scope)
+    target = resolve_return_target(
+        record, scope, current_session_id="20260101_000100_bbb",
+        session_exists=lambda sid: sid == "20260101_000000_aaa")
+
+    assert target == "20260101_000000_aaa"
+    assert record.parent_route == {"model": "parent-model", "provider": "parent-provider"}
+
+
+def test_closing_a_pre_move_detour_rewrites_it_in_place_without_schema_change(home):
+    scope = _scope()
+    _write_legacy_record(home, scope)
+
+    closed = mark_returned(read_record(scope), home)
+
+    assert closed.status == STATUS_RETURNED
+    stored = json.loads(record_path(scope, home).read_text(encoding="utf-8"))
+    assert stored["version"] == RECORD_VERSION
+    # Same key set as the record the old core wrote: nothing added, nothing dropped.
+    assert set(stored) == set(json.loads(LEGACY_RECORD_JSON))
+    assert stored["returned_at"] and stored["parent_session_id"] == "20260101_000000_aaa"

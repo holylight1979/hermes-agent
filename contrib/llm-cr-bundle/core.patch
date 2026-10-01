@@ -1,25 +1,31 @@
 diff --git a/cli.py b/cli.py
-index 58702f1967..469e91b78c 100644
+index 58702f1967..7c3ac73f74 100644
 --- a/cli.py
 +++ b/cli.py
-@@ -41,6 +41,7 @@ from hermes_cli.cli_terminal_mixin import CLITerminalMixin
- from hermes_cli.cli_modal_mixin import CLIModalMixin
- from hermes_cli.cli_stream_mixin import CLIStreamMixin
- from hermes_cli.cli_session_mixin import CLISessionMixin
-+from hermes_cli.cli_detour_mixin import CLIDetourMixin
- from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
- from hermes_cli.cli_voice_mixin import CLIVoiceMixin
- from hermes_cli.cli_status_bar_mixin import CLIStatusBarMixin
-@@ -2527,7 +2528,7 @@ from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
- _PASTE_REF_RE = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
+@@ -3302,11 +3302,20 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
+         return True
  
+     def _run_plugin_slash_command(self, base_cmd: str, user_args: str) -> None:
+-        from hermes_cli.plugins import get_plugin_command_handler, resolve_plugin_command_result
++        from hermes_cli.plugins import (
++            bind_plugin_command_context, get_plugin_command_handler, resolve_plugin_command_result,
++        )
  
--class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
-+class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLIDetourMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
-     """Interactive REPL for the Hermes Agent."""
- 
-     # Seeded -q first message (see _should_seed_interactive); run() re-creates
-@@ -3489,6 +3490,12 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
+-        plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
++        name = base_cmd.lstrip("/")
++        plugin_handler = get_plugin_command_handler(name)
+         if not plugin_handler:
+             return
++        # Handlers that declare a ``context`` parameter get this CLI as their host; the rest are
++        # called unchanged (see plugins.bind_plugin_command_context).
++        plugin_handler = bind_plugin_command_context(plugin_handler, {
++            "surface": "cli", "command": name, "host": self,
++            "session_key": getattr(self, "session_id", None),
++        })
+         try:
+             result = resolve_plugin_command_result(plugin_handler(user_args))
+             if result:
+@@ -3489,6 +3498,12 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
              if not is_seeded_query:
                  if self.handle_bang_shell(user_input):
                      return
@@ -33,763 +39,86 @@ index 58702f1967..469e91b78c 100644
                      user_input = self._tui_run_slash_input(user_input)
                      if user_input is None:
 diff --git a/gateway/run_busy.py b/gateway/run_busy.py
-index f6a8139e34..11d19c4a52 100644
+index f6a8139e34..710103bf89 100644
 --- a/gateway/run_busy.py
 +++ b/gateway/run_busy.py
-@@ -765,7 +765,7 @@ class GatewayBusySessionMixin:
-         "approvals", "model", "codex-runtime", "personality", "suggestions", "save", "retry",
-         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
-         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
--        "loop", "refine", "review", "voice",
-+        "loop", "refine", "review", "voice", "detour", "detour-end",
-     )
+@@ -833,6 +833,11 @@ class GatewayBusySessionMixin:
+                 "falling back to busy-reject", policy, name,
+             )
  
-     def _command_handler_table(self, names) -> Dict[str, Any]:
-diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
-index 4a778d3172..d66cae00a3 100644
---- a/gateway/slash_commands.py
-+++ b/gateway/slash_commands.py
-@@ -28,6 +28,7 @@ from gateway.session_transcript import TranscriptReadError
- from gateway.slash_commands_goals import GatewayGoalCommandsMixin
- from gateway.slash_commands_model import GatewayModelCommandsMixin
- from gateway.slash_commands_session import GatewaySessionCommandsMixin
-+from gateway.slash_commands_detour import GatewayDetourCommandsMixin
- from gateway.slash_commands_login import GatewayLoginCommandsMixin
- from gateway.slash_commands_status import HISTORY_UNREADABLE, GatewayStatusCommandsMixin
- from hermes_cli.config import atomic_config_write, cfg_get
-@@ -164,6 +165,7 @@ def _home_thread_from_source(source) -> Optional[str]:
- class GatewaySlashCommandsMixin(
-     GatewayLoginCommandsMixin,
-     GatewayModelCommandsMixin,
-+    GatewayDetourCommandsMixin,
-     GatewaySessionCommandsMixin,
-     GatewayStatusCommandsMixin,
-     GatewayGoalCommandsMixin):
-diff --git a/gateway/slash_commands_detour.py b/gateway/slash_commands_detour.py
-new file mode 100644
-index 0000000000..7f6352d028
---- /dev/null
-+++ b/gateway/slash_commands_detour.py
-@@ -0,0 +1,327 @@
-+"""Gateway ``/detour`` and ``/detour-end`` — leave for a fresh child session, come back to this one.
-+
-+Both legs are compositions of the NATIVE session commands, never reimplementations:
-+
-+* ``/detour`` writes the lane's return record, then runs ``_handle_reset_command`` (the same code
-+  path as ``/new``: run-generation bump, agent eviction, conversation-scope clear, in-flight
-+  delegation expiry, ``reset_session`` with ``parent_session_id`` set, session hooks), then applies
-+  the requested route through ``_handle_model_command`` as a ``--session`` override.
-+* ``/detour-end`` runs ``_handle_resume_command`` — including its IDOR guard — against the recorded
-+  parent id, then applies the requested route the same way.
-+
-+Consequences of composing rather than copying: the fresh session starts with an empty transcript
-+(``reset_session`` creates a new row; nothing is copied in), the parent's transcript is untouched
-+while the detour runs, and the return leg replays the parent's own history exactly as ``/resume``
-+would. Neither side ever sees the other's messages.
-+
-+Success is decided by STATE, not by the reply text: each leg re-reads the routed session id from
-+the session store and compares it to what it asked for. The record is only promoted to ``active``
-+after the child id is observed, and only consumed after the parent id is observed back on the lane.
-+A failed leg leaves the record exactly as it was, so the return is still available.
-+
-+This is conversation isolation, not a sandbox: the child session has the same tools, permissions
-+and filesystem reach as any other session.
-+"""
-+
-+from __future__ import annotations
-+
-+import asyncio
-+import dataclasses
-+import inspect
-+import logging
-+from typing import Any, Optional, Tuple
-+
-+from hermes_cli.session_detour import (
-+    DetourRecord,
-+    DetourRecordError,
-+    DetourScope,
-+    LaneLockError,
-+    LaneTransitionLock,
-+    begin_detour,
-+    confirm_detour,
-+    delete_child_index,
-+    delete_record,
-+    is_abandoned_enter,
-+    mark_returned,
-+    parse_route_args,
-+    read_record,
-+    record_path,
-+    resolve_return_target,
-+    route_switch_command,
-+    routes_match,
-+)
-+
-+logger = logging.getLogger(__name__)
-+
-+_SURFACE = "gateway"
-+
-+
-+class GatewayDetourCommandsMixin:
-+    """``/detour`` + ``/detour-end`` for GatewayRunner."""
-+
-+    def _detour_scope(self, source: Any, session_key: str) -> DetourScope:
-+        platform = getattr(getattr(source, "platform", None), "value", "") or ""
-+        return DetourScope(
-+            surface=_SURFACE,
-+            channel=f"{platform}:{getattr(source, 'chat_id', '') or ''}",
-+            owner=str(getattr(source, "user_id", "") or ""),
-+            lane=str(session_key or ""),
-+        )
-+
-+    def _detour_parent_route(self, session_key: str) -> dict:
-+        """The lane's live ``/model`` override, or empty strings for "whatever config resolves to"."""
-+        override = self._session_model_override(session_key) or {}
-+        return {"model": str(override.get("model") or ""), "provider": str(override.get("provider") or "")}
-+
-+    def _detour_sync_session_db(self) -> Any:
-+        """The SYNC ``SessionDB`` behind the runner's async facade.
-+
-+        ``self._session_db`` is an ``AsyncSessionDB``: every attribute access returns a coroutine
-+        function. Calling ``get_session`` on it from a worker thread yields a coroutine object, which
-+        is truthy — so an existence check against the facade would pass for a session that is not
-+        there. The detour's gates have to be real, so they go through ``_db``.
-+        """
-+        db = getattr(self, "_session_db", None)
-+        sync = getattr(db, "_db", db)
-+        if inspect.iscoroutinefunction(getattr(sync, "get_session", None)):
-+            # Still an async facade (the private handle moved, or a double was installed). A
-+            # coroutine object is truthy, so answering from it would make every existence gate
-+            # pass. Report "cannot tell" instead and let the gates fail closed.
-+            logger.warning("detour: no synchronous session store available; gates fail closed")
-+            return None
-+        return sync
-+
-+    def _detour_session_exists(self, session_id: str) -> bool:
-+        db = self._detour_sync_session_db()
-+        if db is None:
-+            return False
-+        try:
-+            return db.get_session(session_id) is not None
-+        except Exception:
-+            logger.debug("detour: session existence check failed for %s", session_id, exc_info=True)
-+            return False
-+
-+    def _detour_lineage_parent(self, session_id: str) -> Optional[str]:
-+        """The session store's own ``parent_session_id`` for *session_id* (``reset_session`` sets it)."""
-+        db = self._detour_sync_session_db()
-+        if db is None:
-+            return None
-+        try:
-+            row = db.get_session(session_id) or {}
-+            return str(row.get("parent_session_id") or "") or None
-+        except Exception:
-+            logger.debug("detour: lineage lookup failed for %s", session_id, exc_info=True)
-+            return None
-+
-+    async def _detour_apply_route(self, event: Any, session_key: str, route: dict) -> Tuple[bool, str]:
-+        """Apply *route* as a session-scoped ``/model`` switch; ``(applied, reply)``.
-+
-+        ``applied`` is read back from the lane's live override, not from the handler's reply text: a
-+        leg that claims a model it did not get is worse than one that refuses.
-+        """
-+        text = route_switch_command(route)
-+        if not text:
-+            return True, ""
-+        try:
-+            reply = str(await self._handle_model_command(dataclasses.replace(event, text=text)) or "")
-+        except Exception as exc:
-+            logger.warning("detour: route switch failed: %s", exc, exc_info=True)
-+            return False, f"the model switch failed ({type(exc).__name__})"
-+        if not routes_match(route, self._session_model_override(session_key) or {}):
-+            logger.warning("detour: route %s did not take effect on %s", route, session_key)
-+            return False, f"the model switch did not take effect ({reply.strip() or 'no reason given'})"
-+        return True, reply
-+
-+    # ------------------------------------------------------------------ /detour
-+    async def _handle_detour_command(self, event: Any) -> str:
-+        """``/detour [model] [--provider name]`` — fresh child session, remembering the way back.
-+
-+        The lane's transition lock is held for the WHOLE leg — decide, rotate, bind, switch — not
-+        just the record write. A second ``/detour`` (or a ``/detour-end``) arriving mid-rotation
-+        would otherwise read a lane that is halfway between two sessions.
-+        """
-+        route, error = parse_route_args(event.get_command_args())
-+        if error is not None:
-+            return f"❌ {error}"
-+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
-+        session_key = self._session_key_for_source(source)
-+        scope = self._detour_scope(source, session_key)
-+        lock = LaneTransitionLock(scope)
-+        try:
-+            await asyncio.to_thread(lock.acquire)
-+        except LaneLockError as exc:
-+            # Fail closed: no record written, no session rotated, nothing to clean up.
-+            return f"❌ Detour not started — {exc}."
-+        try:
-+            return await self._detour_enter_locked(event, source, session_key, scope, route)
-+        finally:
-+            await asyncio.to_thread(lock.release)
-+
-+    async def _detour_enter_locked(self, event, source, session_key: str, scope: DetourScope,
-+                                   route: dict) -> str:
-+        entry = await self.async_session_store.get_or_create_session(source)
-+        parent_id = getattr(entry, "session_id", "") or ""
-+
-+        def _open() -> Any:
-+            existing = read_record(scope)
-+            if existing is not None and existing.is_open:
-+                return existing.status, existing
-+            return None, begin_detour(
-+                scope, parent_session_id=parent_id,
-+                parent_route=self._detour_parent_route(session_key), child_route=route,
-+            )
-+
-+        try:
-+            blocked, record = await asyncio.to_thread(_open)
-+        except DetourRecordError as exc:
-+            return f"❌ Detour not started — {exc}."
-+        except Exception as exc:
-+            logger.warning("detour: could not write the return record: %s", exc, exc_info=True)
-+            return f"❌ Detour not started — the return record could not be written ({type(exc).__name__})."
-+        if blocked is not None:
-+            return (
-+                f"⚠️ A detour is already open here (session `{record.child_session_id or '—'}`, "
-+                f"returning to `{record.parent_session_id}`). Use `/detour-end` first — "
-+                "detours do not nest.")
-+
-+        child_id = await self._handle_detour_reset(event) or ""
-+        if not child_id or child_id == parent_id:
-+            # No child session exists, so the record would point at a detour that never happened.
-+            # Only this transition's own record is removed (token-checked).
-+            await asyncio.to_thread(lambda: delete_record(scope, expected_token=record.token))
-+            if not await asyncio.to_thread(self._detour_session_exists, parent_id):
-+                return ("❌ Detour not started — the fresh session could not be created, and the "
-+                        f"original session `{parent_id}` is no longer in the store. "
-+                        f"Recover with `/resume {parent_id}`.")
-+            return "❌ Detour not started — the fresh session could not be created. Nothing changed."
-+
-+        bound = True
-+        try:
-+            record = await asyncio.to_thread(lambda: confirm_detour(record, child_session_id=child_id))
-+        except Exception as exc:
-+            # The child IS live but nothing durable binds it to the parent. Do not claim success:
-+            # roll the lane back onto the parent so the user keeps the conversation they had.
-+            bound = False
-+            logger.warning("detour: could not confirm the return record: %s", exc, exc_info=True)
-+
-+        applied, route_note = await self._detour_apply_route(event, session_key, route)
-+        if bound and applied:
-+            head = (
-+                f"🔀 Detour started — fresh session `{child_id}`, no history carried over.\n"
-+                f"`/detour-end` returns to `{parent_id}` and that conversation's history.")
-+            return f"{head}\n{route_note}" if route_note else head
-+        reason = ("the return record could not be bound to the new session"
-+                  if not bound else route_note)
-+        return await self._detour_rollback_enter(event, session_key, scope, record, parent_id,
-+                                                 child_id, reason)
-+
-+    async def _detour_rollback_enter(self, event, session_key: str, scope: DetourScope,
-+                                     record: DetourRecord, parent_id: str, child_id: str,
-+                                     reason: str) -> str:
-+        """Put the lane back on the parent after a failed enter leg, through native ``/resume``.
-+
-+        If the rollback itself cannot land, the record is deliberately LEFT in place and named: it is
-+        the only durable thing that still knows where this conversation came from.
-+        """
-+        await self._handle_resume_command(dataclasses.replace(event, text=f"/resume {parent_id}"))
-+        if (self.session_store.peek_session_id(session_key) or "") != parent_id:
-+            return (f"❌ Detour not started — {reason}, and returning to `{parent_id}` failed too.\n"
-+                    f"This conversation is on `{child_id}`. Recover with `/resume {parent_id}`.\n"
-+                    f"Record kept: `{record_path(scope)}`")
-+
-+        def _clear() -> None:
-+            delete_record(scope, expected_token=record.token)
-+            if child_id:
-+                delete_child_index(child_id)
-+
-+        await asyncio.to_thread(_clear)
-+        await self._detour_apply_route(event, session_key, record.parent_route)
-+        return (f"❌ Detour not started — {reason}. Back on `{parent_id}` with its history; "
-+                "nothing was left open.")
-+
-+    async def _handle_detour_reset(self, event: Any) -> Optional[str]:
-+        """Run the native ``/new`` reset and report the session id the lane actually routes to."""
-+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
-+        session_key = self._session_key_for_source(source)
-+        try:
-+            await self._handle_reset_command(dataclasses.replace(event, text="/new"))
-+        except Exception as exc:
-+            logger.warning("detour: native session reset failed: %s", exc, exc_info=True)
-+            return None
-+        return self.session_store.peek_session_id(session_key)
-+
-+    # ------------------------------------------------------------------ /detour-end
-+    async def _handle_detour_end_command(self, event: Any) -> str:
-+        """``/detour-end [model] [--provider name]`` — restore the recorded parent session."""
-+        route, error = parse_route_args(event.get_command_args())
-+        if error is not None:
-+            return f"❌ {error}"
-+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
-+        session_key = self._session_key_for_source(source)
-+        scope = self._detour_scope(source, session_key)
-+        lock = LaneTransitionLock(scope)
-+        try:
-+            await asyncio.to_thread(lock.acquire)
-+        except LaneLockError as exc:
-+            # The detour stays open and untouched, so the return is still retryable.
-+            return f"❌ Could not end the detour — {exc}."
-+        try:
-+            return await self._detour_end_locked(event, session_key, scope, route)
-+        finally:
-+            await asyncio.to_thread(lock.release)
-+
-+    async def _detour_end_locked(self, event, session_key: str, scope: DetourScope,
-+                                 route: dict) -> str:
-+        current_id = self.session_store.peek_session_id(session_key) or ""
-+
-+        def _resolve() -> Tuple[Optional[DetourRecord], Optional[str]]:
-+            record = read_record(scope)
-+            if is_abandoned_enter(record, current_session_id=current_id):
-+                # The enter leg never rotated; clear the record so the lane is not wedged.
-+                mark_returned(record)
-+                return record, None
-+            return record, resolve_return_target(
-+                record, scope, current_session_id=current_id,
-+                session_exists=self._detour_session_exists,
-+                lineage_parent=self._detour_lineage_parent,
-+            )
-+
-+        try:
-+            record, target = await asyncio.to_thread(_resolve)
-+        except DetourRecordError as exc:
-+            # Fail closed: no session is created or switched, and the record (if any) is untouched.
-+            return self._detour_end_refusal(scope, str(exc))
-+        except Exception as exc:
-+            logger.warning("detour: return record unreadable: %s", exc, exc_info=True)
-+            return f"❌ Could not end the detour — the return record is unusable ({type(exc).__name__})."
-+        if target is None:
-+            return "The detour never started — the record is cleared and this conversation is unchanged."
-+
-+        reply = await self._handle_resume_command(dataclasses.replace(event, text=f"/resume {target}"))
-+        if (self.session_store.peek_session_id(session_key) or "") != target:
-+            # The native resume refused (ownership guard, missing transcript, ...). Keep the record,
-+            # so the return is still retryable.
-+            return f"❌ Could not return to `{target}` — the detour stays open.\n{reply}"
-+
-+        # The resume cleared this lane's conversation-scoped state, the parent's /model override
-+        # included, so the parent's route has to be re-applied or the user comes back to a session
-+        # that is silently on the config default. An explicit argument wins over the recorded route.
-+        wanted = route if (route.get("model") or route.get("provider")) else record.parent_route
-+        applied, route_note = await self._detour_apply_route(event, session_key, wanted)
-+        try:
-+            await asyncio.to_thread(lambda: mark_returned(record))
-+        except Exception as exc:
-+            logger.warning("detour: could not mark the record returned: %s", exc, exc_info=True)
-+        head = f"↩️ Back on `{target}` — the detour session is archived, not deleted."
-+        if not applied:
-+            retry = route_switch_command(wanted)
-+            route_note = (f"⚠️ The conversation is restored but its model was not — {route_note}. "
-+                          f"Re-apply with `{retry}`.")
-+        return "\n".join(part for part in (head, reply, route_note) if part)
-+
-+    def _detour_end_refusal(self, scope: DetourScope, reason: str) -> str:
-+        """Refusal copy. A plain "nothing open" is a quiet no-op; anything else names the file so an
-+        operator can inspect (or remove) it."""
-+        if reason == "no detour is open for this conversation":
-+            return "Nothing to end — no detour is open for this conversation."
-+        return f"❌ Could not end the detour — {reason}.\nRecord: `{record_path(scope)}`"
-diff --git a/hermes_cli/cli_detour_mixin.py b/hermes_cli/cli_detour_mixin.py
-new file mode 100644
-index 0000000000..d89d26677b
---- /dev/null
-+++ b/hermes_cli/cli_detour_mixin.py
-@@ -0,0 +1,371 @@
-+"""CLI ``/detour`` and ``/detour-end`` — leave for a fresh side session, then come back.
-+
-+The CLI half of the same round trip the gateway implements, built the same way: out of the native
-+session commands, never around them.
-+
-+* ``/detour`` writes the lane's return record, then calls :meth:`new_session` — the ``/new`` path,
-+  with its memory-boundary flush, session-DB rotation, agent state reset and prompt invalidation —
-+  then applies the requested route through ``/model ... --session``.
-+* ``/detour-end`` calls ``_handle_resume_command`` against the recorded parent id, so the parent's
-+  transcript is replayed by the same code a hand-typed ``/resume`` runs, then restores the parent's
-+  own route (``/new`` and ``/resume`` both reset model/provider to the config default, so coming
-+  back to "the session I left" means re-applying what the record saved).
-+
-+Nothing copies history in either direction: ``new_session`` starts with an empty
-+``conversation_history`` and the resume leg loads the parent's own rows from the session DB.
-+
-+Lane scope. A CLI has no routing key and no stable identity across the rotation, so the record is
-+keyed on the ORIGINATING session id (plus OS user, inside the active Hermes home). Two CLIs that
-+detour at the same time therefore write two records and never see each other's. The return leg,
-+which only knows the *child* session, finds its record the way the enter leg left it findable:
-+
-+1. the in-process handle, when it is the same CLI that entered;
-+2. the child→lane index file written at confirm time (survives a restart);
-+3. failing both, the session store's own parent link for the current session.
-+
-+None of those is trusted on its own — whatever they name is still read through ``read_record``
-+(scope must match the recomputed digest) and still has to pass every gate in
-+``resolve_return_target``. The directory is never scanned for "some open record".
-+"""
-+
-+from __future__ import annotations
-+
-+import getpass
-+import logging
-+from typing import Optional
-+
-+from hermes_cli.session_detour import (
-+    DetourRecord,
-+    DetourRecordError,
-+    DetourScope,
-+    LaneLockError,
-+    LaneTransitionLock,
-+    begin_detour,
-+    confirm_detour,
-+    delete_child_index,
-+    delete_record,
-+    is_abandoned_enter,
-+    mark_returned,
-+    parse_route_args,
-+    read_record,
-+    record_path,
-+    resolve_return_target,
-+    route_switch_command,
-+    routes_match,
-+    scope_for_child,
-+)
-+
-+logger = logging.getLogger(__name__)
-+
-+_SURFACE = "cli"
-+
-+
-+def _os_user() -> str:
-+    try:
-+        return getpass.getuser() or ""
-+    except Exception:
-+        return ""
-+
-+
-+class CLIDetourMixin:
-+    """``/detour`` + ``/detour-end`` for HermesCLI."""
-+
-+    #: Set while this process holds an open detour, so the return leg does not have to rediscover
-+    #: the lane it just created. Never the only path: a restart clears it (see the index file).
-+    _detour_open_scope: Optional[DetourScope] = None
-+
-+    # ------------------------------------------------------------------ scope / lookups
-+    def _detour_scope_for_parent(self, parent_session_id: str) -> DetourScope:
-+        """The lane for a detour that leaves *parent_session_id* — one record per originating session."""
-+        return DetourScope(surface=_SURFACE, channel="local", owner=_os_user(),
-+                           lane=str(parent_session_id or ""))
-+
-+    def _detour_session_exists(self, session_id: str) -> bool:
-+        db = getattr(self, "_session_db", None)
-+        if db is None:
-+            return False
-+        try:
-+            return db.get_session(session_id) is not None
-+        except Exception:
-+            logger.debug("detour: session existence check failed for %s", session_id, exc_info=True)
-+            return False
-+
-+    def _detour_lineage_parent(self, session_id: str) -> Optional[str]:
-+        """The session row's own ``parent_session_id``, used only to prove a child's lineage."""
-+        db = getattr(self, "_session_db", None)
-+        if db is None or not session_id:
-+            return None
-+        try:
-+            row = db.get_session(session_id) or {}
-+            return str(row.get("parent_session_id") or "") or None
-+        except Exception:
-+            logger.debug("detour: lineage lookup failed for %s", session_id, exc_info=True)
-+            return None
-+
-+    def _detour_discover_scope(self, current_id: str) -> Optional[DetourScope]:
-+        """The lane whose detour this session is sitting in, or None."""
-+        if self._detour_open_scope is not None:
-+            return self._detour_open_scope
-+        from_index = scope_for_child(current_id)
-+        if from_index is not None:
-+            return from_index
-+        parent = self._detour_lineage_parent(current_id)
-+        return self._detour_scope_for_parent(parent) if parent else None
-+
-+    def _detour_open_lane(self, current_id: str):
-+        """``(scope, record)`` when *current_id* is already INSIDE an open detour, else None.
-+
-+        The CLI's lane key is the originating session id, so the lane a ``/detour`` would create
-+        from inside a detour is a different one from the lane that is already open — checking only
-+        the new lane would find nothing and happily nest, orphaning the first child session and
-+        stranding its record (its ``child_session_id`` is no longer the live session, so the return
-+        leg would refuse forever). This looks at the lane the CURRENT session belongs to.
-+
-+        A lane whose own key is this session is deliberately NOT reported: that is the abandoned
-+        enter (record written, rotation never happened), which :meth:`_detour_enter_locked` already
-+        refuses with the same copy and ``/detour-end`` can clear.
-+        """
-+        scope = self._detour_discover_scope(current_id)
-+        if scope is None or scope.parts == self._detour_scope_for_parent(current_id).parts:
-+            return None
-+        try:
-+            with LaneTransitionLock(scope):
-+                record = read_record(scope)
-+        except LaneLockError:
-+            # Nothing was read and nothing was written. The command refuses as a whole.
-+            raise
-+        except DetourRecordError as exc:
-+            # Unreadable, but something IS open here. Fail closed rather than nest.
-+            logger.warning("detour: open-lane record unreadable: %s", exc)
-+            return scope, None
-+        except Exception:
-+            logger.debug("detour: open-lane lookup failed for %s", current_id, exc_info=True)
-+            return None
-+        return (scope, record) if (record is not None and record.is_open) else None
-+
-+    def _detour_refuse_nested(self, scope: DetourScope, record: Optional[DetourRecord]) -> None:
-+        from cli import _cprint
-+
-+        if record is None:
-+            return _cprint(
-+                "  ✗ A detour is already open for this conversation, but its record could not be "
-+                f"read.\n    Use /detour-end, or inspect {record_path(scope)}.")
-+        return _cprint(
-+            f"  ✗ A detour is already open (session {record.child_session_id or '—'}, "
-+            f"returning to {record.parent_session_id}).\n"
-+            "    Use /detour-end first — detours do not nest.")
-+
-+    # ------------------------------------------------------------------ route plumbing
-+    def _detour_route_args(self, cmd_original: str):
-+        """``({model, provider}, None)`` for the trailing ``/model`` arguments, or ``(None, error)``."""
-+        parts = (cmd_original or "").split(None, 1)
-+        return parse_route_args(parts[1] if len(parts) > 1 else "")
-+
-+    def _detour_live_route(self) -> dict:
-+        return {"model": getattr(self, "model", "") or "", "provider": getattr(self, "provider", "") or ""}
-+
-+    def _detour_apply_route(self, route: dict) -> bool:
-+        """Apply *route* as a session-scoped switch; True when the LIVE model/provider then match it."""
-+        command = route_switch_command(route)
-+        if not command:
-+            return True
-+        try:
-+            self._handle_model_switch(command)
-+        except Exception as exc:
-+            logger.warning("detour: route switch failed: %s", exc, exc_info=True)
-+            return False
-+        if not routes_match(route, self._detour_live_route()):
-+            logger.warning("detour: route %s did not take effect (live %s)", route, self._detour_live_route())
-+            return False
-+        return True
-+
-+    # ------------------------------------------------------------------ /detour
-+    def _handle_detour_command(self, cmd_original: str) -> None:
-+        """``/detour [model] [--provider name]`` — fresh side session, remembering the way back."""
-+        from cli import _cprint
-+
-+        route, error = self._detour_route_args(cmd_original)
-+        if error is not None:
-+            return _cprint(f"  ✗ {error}")
-+        parent_id = getattr(self, "session_id", "") or ""
-+        scope = self._detour_scope_for_parent(parent_id)
-+        # One lock for the whole transition: decide, rotate, bind, switch. A lane that cannot be
-+        # locked refuses here, before any session or record is touched.
-+        try:
-+            already_open = self._detour_open_lane(parent_id)
-+            if already_open is not None:
-+                return self._detour_refuse_nested(*already_open)
-+            lock = LaneTransitionLock(scope).acquire()
-+        except LaneLockError as exc:
-+            return _cprint(f"  ✗ Detour not started — {exc}.")
-+        try:
-+            self._detour_enter_locked(scope, parent_id, route)
-+        finally:
-+            lock.release()
-+
-+    def _detour_enter_locked(self, scope: DetourScope, parent_id: str, route: dict) -> None:
-+        from cli import _cprint
-+
-+        try:
-+            existing = read_record(scope)
-+            if existing is not None and existing.is_open:
-+                return _cprint(
-+                    f"  ✗ A detour is already open (session {existing.child_session_id or '—'}, "
-+                    f"returning to {existing.parent_session_id}).\n"
-+                    "    Use /detour-end first — detours do not nest.")
-+            record = begin_detour(
-+                scope, parent_session_id=parent_id, parent_route=self._detour_live_route(),
-+                child_route=route)
-+        except DetourRecordError as exc:
-+            return _cprint(f"  ✗ Detour not started — {exc}.")
-+        except Exception as exc:
-+            logger.warning("detour: could not write the return record: %s", exc, exc_info=True)
-+            return _cprint(
-+                f"  ✗ Detour not started — the return record could not be written ({type(exc).__name__}).")
-+
-+        try:
-+            self.new_session(silent=True)
-+        except Exception as exc:
-+            # ``new_session`` can fail partway: it may already have ended (and pruned) the parent row
-+            # before raising. Check live state rather than assuming nothing moved.
-+            logger.warning("detour: native new_session failed: %s", exc, exc_info=True)
-+            return self._detour_abort_enter(scope, record, parent_id, route,
-+                                            "the fresh session could not be created")
-+        child_id = getattr(self, "session_id", "") or ""
-+        if not child_id or child_id == parent_id:
-+            return self._detour_abort_enter(scope, record, parent_id, route,
-+                                            "the session did not rotate")
-+        # ``new_session`` prunes a parent row that never gained content, which would leave the return
-+        # leg with nothing to resume. Put the row back (empty, which is what it was) so an immediate
-+        # /detour from a brand-new session is still returnable.
-+        self._detour_ensure_parent_row(parent_id, record)
-+
-+        try:
-+            record = confirm_detour(record, child_session_id=child_id)
-+        except Exception as exc:
-+            # The child is live but nothing durable binds it to the parent. Do not report success:
-+            # go back to the parent so the user keeps the conversation they had.
-+            logger.warning("detour: could not confirm the return record: %s", exc, exc_info=True)
-+            return self._detour_abort_enter(
-+                scope, record, parent_id, route,
-+                "the return record could not be bound to the new session", child_id=child_id)
-+
-+        self._detour_open_scope = scope
-+        if not self._detour_apply_route(route):
-+            return self._detour_abort_enter(
-+                scope, record, parent_id, route, "the model switch did not take effect",
-+                child_id=child_id)
-+        _cprint(f"  ⤳ Detour started — fresh session {child_id}, no history carried over.")
-+        _cprint(f"    /detour-end returns to {parent_id} and that conversation's history.")
-+
-+    def _detour_ensure_parent_row(self, parent_id: str, record: DetourRecord) -> None:
-+        """Make sure the parent session still has a row to come back to."""
-+        db = getattr(self, "_session_db", None)
-+        if db is None or not parent_id or self._detour_session_exists(parent_id):
-+            return
-+        try:
-+            import os as _os
-+
-+            db.ensure_session(
-+                parent_id, source=_os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-+                model=record.parent_route.get("model") or None)
-+            logger.info("detour: restored the pruned empty parent row %s", parent_id)
-+        except Exception:
-+            logger.warning("detour: could not restore the parent row %s", parent_id, exc_info=True)
-+
-+    def _detour_abort_enter(self, scope: DetourScope, record: DetourRecord, parent_id: str,
-+                            route: dict, reason: str, *, child_id: str = "") -> None:
-+        """Undo a failed enter leg: back onto the parent through native ``/resume``, record cleared.
-+
-+        A rollback that cannot land leaves the record in place ON PURPOSE and names it — it is the
-+        only durable thing that still knows where this conversation came from.
-+        """
-+        from cli import _cprint
-+
-+        self._detour_open_scope = None
-+        current = getattr(self, "session_id", "") or ""
-+        if current and current != parent_id:
-+            self._detour_ensure_parent_row(parent_id, record)
-+            try:
-+                self._handle_resume_command(f"/resume {parent_id}")
-+            except Exception:
-+                logger.warning("detour: rollback resume failed for %s", parent_id, exc_info=True)
-+            if (getattr(self, "session_id", "") or "") != parent_id:
-+                return _cprint(
-+                    f"  ✗ Detour not started — {reason}, and returning to {parent_id} failed too.\n"
-+                    f"    This session is {getattr(self, 'session_id', '') or '—'}; "
-+                    f"recover with /resume {parent_id}\n"
-+                    f"    Record kept: {record_path(scope)}")
-+            self._detour_apply_route(record.parent_route)
-+        delete_record(scope, expected_token=record.token)
-+        if child_id:
-+            delete_child_index(child_id)
-+        _cprint(f"  ✗ Detour not started — {reason}. Still on {parent_id}; nothing was left open.")
-+
-+    # ------------------------------------------------------------------ /detour-end
-+    def _handle_detour_end_command(self, cmd_original: str) -> None:
-+        """``/detour-end [model] [--provider name]`` — restore the recorded parent session."""
-+        from cli import _cprint
-+
-+        route, error = self._detour_route_args(cmd_original)
-+        if error is not None:
-+            return _cprint(f"  ✗ {error}")
-+        current_id = getattr(self, "session_id", "") or ""
-+        scope = self._detour_discover_scope(current_id)
-+        if scope is None:
-+            return _cprint("  Nothing to end — no detour is open for this session.")
-+        try:
-+            lock = LaneTransitionLock(scope).acquire()
-+        except LaneLockError as exc:
-+            # The detour stays exactly as it is, so the return is still retryable.
-+            return _cprint(f"  ✗ Could not end the detour — {exc}.")
-+        try:
-+            self._detour_end_locked(scope, current_id, route)
-+        finally:
-+            lock.release()
-+
-+    def _detour_end_locked(self, scope: DetourScope, current_id: str, route: dict) -> None:
-+        from cli import _cprint
-+
-+        try:
-+            record = read_record(scope)
-+            if is_abandoned_enter(record, current_session_id=current_id):
-+                # The enter leg never rotated; clear it so the lane is not wedged.
-+                mark_returned(record)
-+                self._detour_open_scope = None
-+                return _cprint(
-+                    "  The detour never started — record cleared, this session is unchanged.")
-+            target = resolve_return_target(
-+                record, scope, current_session_id=current_id,
-+                session_exists=self._detour_session_exists,
-+                lineage_parent=self._detour_lineage_parent)
-+        except DetourRecordError as exc:
-+            # Fail closed: no session is created or switched, and the record is left untouched.
-+            if str(exc) == "no detour is open for this conversation":
-+                return _cprint("  Nothing to end — no detour is open.")
-+            return _cprint(f"  ✗ Could not end the detour — {exc}.\n    Record: {record_path(scope)}")
-+        except Exception as exc:
-+            logger.warning("detour: return record unreadable: %s", exc, exc_info=True)
-+            return _cprint(
-+                f"  ✗ Could not end the detour — the return record is unusable ({type(exc).__name__}).")
-+
-+        try:
-+            self._handle_resume_command(f"/resume {target}")
-+        except Exception as exc:
-+            logger.warning("detour: native resume failed for %s: %s", target, exc, exc_info=True)
-+        if (getattr(self, "session_id", "") or "") != target:
-+            # Keep the record: the return is still retryable.
-+            return _cprint(f"  ✗ Could not return to {target} — the detour stays open.")
-+
-+        # ``/resume`` re-derives model/provider from config, so the parent's own route has to be
-+        # re-applied or "back on the earlier session" would quietly mean "on the default model".
-+        wanted = route if (route.get("model") or route.get("provider")) else record.parent_route
-+        applied = self._detour_apply_route(wanted)
-+        try:
-+            mark_returned(record)
-+        except Exception as exc:
-+            logger.warning("detour: could not mark the record returned: %s", exc, exc_info=True)
-+        self._detour_open_scope = None
-+        _cprint("  ↩ Back on the earlier session — the detour session is archived, not deleted.")
-+        if not applied:
-+            _cprint(f"    ⚠ Its model was not restored. Re-apply with: {route_switch_command(wanted)}")
-diff --git a/hermes_cli/commands.py b/hermes_cli/commands.py
-index 5bc9eabeb4..1743a6c6a2 100644
---- a/hermes_cli/commands.py
-+++ b/hermes_cli/commands.py
-@@ -145,6 +145,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
-                gateway_only=True, aliases=("set-home",), desktop="terminal"),
-     CommandDef("resume", "Resume a previously-named session", "Session",
-                args_hint="[name]", argument_mode="mixed"),
-+    CommandDef("detour", "Leave for a fresh side session (this one is kept to return to)", "Session",
-+               args_hint="[model] [--provider name]", argument_mode="mixed"),
-+    CommandDef("detour-end", "Return to the session the detour left, restoring its history", "Session",
-+               args_hint="[model] [--provider name]", argument_mode="mixed"),
-     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
++        return self._busy_reject_text(name)
++
++    @staticmethod
++    def _busy_reject_text(name: str) -> str:
++        """The mid-run refusal for ``/name`` (shared with the plugin-command busy path)."""
+         return (
+             f"⏳ Agent is running — `/{name}` can't run "
+             f"mid-turn. Wait for the current response or `/stop` first."
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 6fff563305..143aa22c09 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -520,6 +520,16 @@ class GatewayInboundMixin:
+             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
+             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
  
-     # Configuration
++        # A plugin-registered command that declared busy_policy="reject" is refused here for the
++        # same reason built-ins are (see _dispatch_busy_slash_command): falling through would
++        # interrupt the running agent and then run the command against a half-torn-down turn.
++        if _evt_cmd:
++            _plugin_cmd = _evt_cmd.replace("_", "-")
++            from hermes_cli.plugins import get_plugin_command_busy_policy
++            if get_plugin_command_busy_policy(_plugin_cmd) == "reject":
++                _denied = self._check_slash_access(source, _plugin_cmd)
++                return True, _denied if _denied is not None else self._busy_reject_text(_plugin_cmd)
++
+         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
+         # photo-only follow-up; adapter-level batching absorbs them.
+         if event.message_type == MessageType.PHOTO:
+@@ -949,6 +959,14 @@ class GatewayInboundMixin:
+         except Exception as e:
+             return f"Quick command error: {e}"
+ 
++    def _plugin_command_session_key(self, source: SessionSource) -> Optional[str]:
++        """The routed session key for a plugin command's host context (None if unresolvable)."""
++        try:
++            return self._session_key_for_source(self._normalize_source_for_session_key(source))
++        except Exception:
++            logger.debug("plugin command: session key resolution failed", exc_info=True)
++            return None
++
+     async def _hm_dispatch_quick_and_plugin_commands(
+         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
+     ) -> Tuple[bool, Optional[str], Optional[str]]:
+@@ -985,9 +1003,26 @@ class GatewayInboundMixin:
+         # underscored autocomplete form matches plugin commands registered with hyphens.
+         if command:
+             try:
+-                from hermes_cli.plugins import get_plugin_command_handler
+-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
++                from hermes_cli.plugins import (
++                    bind_plugin_command_context, get_plugin_command_handler,
++                )
++                _plugin_name = command.replace("_", "-")
++                plugin_handler = get_plugin_command_handler(_plugin_name)
+                 if plugin_handler:
++                    # Gate on the NORMALIZED name. The cold-path gate in _hm_resolve_command runs
++                    # against the typed form, so the underscored autocomplete spelling of a
++                    # hyphenated plugin command (/detour_end) would otherwise reach this dispatch
++                    # sink unchecked — the same hole the quick-command gate above closes.
++                    _denied = self._check_slash_access(source, _plugin_name)
++                    if _denied is not None:
++                        return True, _denied, command
++                    # Handlers that declare a ``context`` parameter get this gateway, the event and
++                    # the routed session as their host context; the rest are called unchanged.
++                    plugin_handler = bind_plugin_command_context(plugin_handler, {
++                        "surface": "gateway", "command": _plugin_name, "host": self,
++                        "session_key": self._plugin_command_session_key(source),
++                        "event": event, "source": source,
++                    })
+                     result = plugin_handler(event.get_command_args().strip())
+                     if asyncio.iscoroutine(result):
+                         result = await result
 diff --git a/hermes_cli/config.py b/hermes_cli/config.py
 index 6f9a67a62a..b983be17eb 100644
 --- a/hermes_cli/config.py
@@ -849,670 +178,98 @@ index 897e4afc07..f6877ac2fe 100644
          except Exception as exc:
              logger.warning(
                  "Middleware '%s' callback %s raised: %s",
-diff --git a/hermes_cli/session_detour.py b/hermes_cli/session_detour.py
-new file mode 100644
-index 0000000000..193a9857a2
---- /dev/null
-+++ b/hermes_cli/session_detour.py
-@@ -0,0 +1,658 @@
-+"""Session detour return records — the state behind ``/detour`` and ``/detour-end``.
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index bc45188e48..c7252871f0 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -651,11 +651,20 @@ class PluginContext:
+     @_serialized_replacement
+     def register_command(
+         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
+-        argument_mode: str | None = None,
++        argument_mode: str | None = None, busy_policy: str | None = None,
+     ) -> Optional[PluginRegistration]:
+         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
+         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
+-        field; without it the command registers parameterless there but still accepts trailing text."""
++        field; without it the command registers parameterless there but still accepts trailing text.
 +
-+A *detour* is a round trip: the surface leaves the current conversation for a genuinely fresh
-+child session (usually on a different model), and later returns to the ORIGINAL parent session.
-+Neither transcript is ever copied into the other; the only thing that crosses the boundary is the
-+small record this module owns, which says *where to come back to*.
++        A handler that also declares a keyword ``context`` parameter
++        (``fn(raw_args, *, context=None)``) receives the dispatching surface's host context — see
++        :func:`bind_plugin_command_context`.
 +
-+Why a record on disk at all: the return target cannot be recovered from live state. The child's
-+``parent_session_id`` column names the parent, but a surface that restarts mid-detour has no live
-+handle to either, and the parent's own route (model/provider at the time of leaving) is gone the
-+moment the child's override is applied. The record is the one durable thing that makes the return
-+leg possible, so it is written BEFORE the child exists and only consumed after a restore succeeds.
-+
-+Scoping. One record per conversation *lane*, inside the active Hermes home (so profiles are
-+isolated structurally, not by a field we have to remember to compare):
-+
-+    <HERMES_HOME>/session-detours/<fingerprint>.json
-+
-+The fingerprint is a digest of (surface, channel, owner, lane) — never a user-supplied string — so
-+no caller can name a file outside that directory. The readable scope fields are stored *inside*
-+the JSON, which is UTF-8 and indented on purpose: an operator inspecting a stuck detour should be
-+able to read it without a tool.
-+
-+Ownership is checked on BOTH sides of the digest: the record's own ``scope`` must match the
-+caller's recomputed scope, and (once the child exists) ``child_session_id`` must be the caller's
-+*current* session. That second check is what makes a lane-wide key safe — a second process in the
-+same lane that is not sitting in the child session cannot use the record to reach the parent.
-+
-+Nothing here stores credentials, prompts or transcript content; ``*_route`` carries a model and
-+provider name only.
-+"""
-+
-+from __future__ import annotations
-+
-+import hashlib
-+import json
-+import logging
-+import os
-+import re
-+import threading
-+import uuid
-+from contextlib import contextmanager, suppress
-+from dataclasses import dataclass, replace
-+from datetime import datetime, timezone
-+from pathlib import Path
-+from typing import Any, Callable, Dict, Iterator, Optional
-+
-+logger = logging.getLogger(__name__)
-+
-+RECORD_VERSION = 1
-+
-+#: Written before the child session exists. A record left in this state means the enter leg died
-+#: between the write and the rotation; the parent id is already known, so returning still works.
-+STATUS_ENTERING = "entering"
-+#: The child session exists and is the live conversation.
-+STATUS_ACTIVE = "active"
-+#: The parent was restored. Kept (not deleted) so a repeated ``/detour-end`` is a quiet no-op and
-+#: an operator can still see what happened.
-+STATUS_RETURNED = "returned"
-+
-+_OPEN_STATUSES = frozenset({STATUS_ENTERING, STATUS_ACTIVE})
-+_KNOWN_STATUSES = _OPEN_STATUSES | {STATUS_RETURNED}
-+
-+RECORD_DIRNAME = "session-detours"
-+
-+# Session ids are generated (``%Y%m%d_%H%M%S_<hex>``); this is a shape gate, not a parser. It
-+# exists so a hand-edited record can never smuggle a path fragment into a resume target.
-+_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
++        ``busy_policy="reject"`` declares the command unsafe to run while this session's agent is
++        running, so the gateway's busy fast-path refuses it instead of interrupting the turn
++        (the same treatment a built-in ``CommandDef(busy_policy="reject")`` gets). ``None`` keeps
++        the historical behavior: the busy path does not recognize the command."""
+         clean = name.lower().strip().lstrip("/").replace(" ", "-")
+         if not clean:
+             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
+@@ -672,6 +681,7 @@ class PluginContext:
+             "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
+             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
+             else ("text" if hint else None),
++            "busy_policy": busy_policy if busy_policy in VALID_PLUGIN_COMMAND_BUSY_POLICIES else None,
+         }
+         return self._register_entry("command", clean, self._manager._plugin_commands, entry,
+                                     "Plugin %s registered command: /%s", clean)
+@@ -1982,6 +1992,56 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
+     return entry["handler"] if entry else None
+ 
+ 
++#: Busy policies a plugin command may declare. Only "reject" is accepted: a plugin command has no
++#: mid-run handler table to dispatch into, so "dispatch"/"interrupt_then_dispatch" would have
++#: nothing to mean here.
++VALID_PLUGIN_COMMAND_BUSY_POLICIES: Set[str] = {"reject"}
 +
 +
-+class DetourRecordError(Exception):
-+    """A record exists but cannot be trusted. Carries user-facing copy; the record is left alone.
-+
-+    Every raise site here is a fail-closed path: the caller reports the message and changes no
-+    session state.
-+    """
++def get_plugin_command_busy_policy(name: str) -> Optional[str]:
++    """The ``busy_policy`` a plugin declared for ``/name``, or ``None`` when it declared none."""
++    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
++    return (entry or {}).get("busy_policy") or None
 +
 +
-+class LaneLockError(DetourRecordError):
-+    """The lane's transition lock could not be taken, so no leg may run.
-+
-+    A subclass of :class:`DetourRecordError` so every existing ``except DetourRecordError`` site
-+    keeps failing closed; the command entry points catch it by name to report the right copy.
-+    """
-+
-+
-+#: Deliberately generic: a lock failure is reported to whoever typed the command, so it names no
-+#: path, errno or exception type. The details go to the log instead.
-+LOCK_REFUSAL = "the conversation lane could not be locked, so nothing was changed"
-+
-+
-+@dataclass(frozen=True)
-+class DetourScope:
-+    """The conversation lane a detour belongs to.
-+
-+    ``lane`` is the surface's own stable routing handle (the gateway ``session_key``) — deliberately
-+    NOT a session id, which rotates on the very reset the enter leg performs.
-+    """
-+
-+    surface: str
-+    channel: str = ""
-+    owner: str = ""
-+    lane: str = ""
-+
-+    def __post_init__(self) -> None:
-+        if not str(self.surface).strip():
-+            raise ValueError("DetourScope.surface is required")
-+
-+    @property
-+    def parts(self) -> tuple[str, str, str, str]:
-+        return (
-+            str(self.surface).strip().casefold(),
-+            str(self.channel or "").strip(),
-+            str(self.owner or "").strip(),
-+            str(self.lane or "").strip(),
-+        )
-+
-+    @property
-+    def lane_parts(self) -> tuple[str, str, str]:
-+        """The lane WITHOUT the owner — the unit a session rotation actually belongs to."""
-+        surface, channel, _owner, lane = self.parts
-+        return (surface, channel, lane)
-+
-+    def fingerprint(self) -> str:
-+        """Filename-safe digest of the lane. Unit separator: no component can forge another."""
-+        return hashlib.sha256("\x1f".join(self.parts).encode("utf-8")).hexdigest()[:40]
-+
-+    def lane_fingerprint(self) -> str:
-+        """Digest of the owner-independent lane, used for the transition lock.
-+
-+        Records are per (lane, owner) — two people in one group chat each get their own return
-+        target. The *rotation* they perform is not per-owner: both move the single session this
-+        lane routes to. So the lock is keyed on the lane alone, or two owners could rotate the
-+        same lane concurrently and one of them would record a parent that is already gone.
-+        """
-+        return hashlib.sha256("\x1f".join(("lane", *self.lane_parts)).encode("utf-8")).hexdigest()[:40]
-+
-+    def to_json(self) -> Dict[str, str]:
-+        surface, channel, owner, lane = self.parts
-+        return {"surface": surface, "channel": channel, "owner": owner, "lane": lane}
-+
-+    @classmethod
-+    def from_json(cls, data: Any) -> Optional["DetourScope"]:
-+        if not isinstance(data, dict) or not str(data.get("surface") or "").strip():
-+            return None
-+        return cls(
-+            surface=str(data.get("surface") or ""), channel=str(data.get("channel") or ""),
-+            owner=str(data.get("owner") or ""), lane=str(data.get("lane") or ""),
-+        )
-+
-+
-+@dataclass(frozen=True)
-+class DetourRecord:
-+    """One lane's return record. ``parent_route`` / ``child_route`` are ``{model, provider}`` only."""
-+
-+    scope: DetourScope
-+    parent_session_id: str
-+    status: str = STATUS_ENTERING
-+    child_session_id: str = ""
-+    profile: str = ""
-+    parent_route: Dict[str, str] = None  # type: ignore[assignment]
-+    child_route: Dict[str, str] = None  # type: ignore[assignment]
-+    entered_at: str = ""
-+    returned_at: str = ""
-+    #: Per-transition ownership token. Every write after :func:`begin_detour` is a compare-and-swap
-+    #: against it, so a leg that was overtaken (another process already ended and re-entered the
-+    #: detour) fails loudly instead of stamping its stale view over the live record.
-+    token: str = ""
-+    version: int = RECORD_VERSION
-+
-+    def __post_init__(self) -> None:
-+        object.__setattr__(self, "parent_route", _route(self.parent_route))
-+        object.__setattr__(self, "child_route", _route(self.child_route))
-+
-+    @property
-+    def is_open(self) -> bool:
-+        return self.status in _OPEN_STATUSES
-+
-+    def to_json(self) -> Dict[str, Any]:
-+        return {
-+            "version": self.version,
-+            "status": self.status,
-+            "profile": self.profile,
-+            "scope": self.scope.to_json(),
-+            "parent_session_id": self.parent_session_id,
-+            "child_session_id": self.child_session_id,
-+            "parent_route": dict(self.parent_route),
-+            "child_route": dict(self.child_route),
-+            "entered_at": self.entered_at,
-+            "returned_at": self.returned_at,
-+            "token": self.token,
-+        }
-+
-+
-+def _route(value: Any) -> Dict[str, str]:
-+    """``{model, provider}`` as strings. Any other key is dropped: the record is not a config
-+    channel, and a stray ``api_key`` must never reach the file."""
-+    source = value if isinstance(value, dict) else {}
-+    return {key: str(source.get(key) or "") for key in ("model", "provider")}
-+
-+
-+def _now() -> str:
-+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-+
-+
-+def active_profile_name() -> str:
-+    """Readable profile label for the record. Never used for scoping (the home path is)."""
++def _handler_accepts_context(handler: Callable) -> bool:
++    """True when *handler* declares a ``context`` parameter (so the surface may pass one)."""
 +    try:
-+        from hermes_cli.profiles import get_active_profile_name
-+
-+        return get_active_profile_name() or "default"
-+    except Exception:
-+        return "default"
-+
-+
-+def detour_root(home: Any = None) -> Path:
-+    """The active home's record directory. ``home`` is for tests and profile-explicit callers."""
-+    if home is None:
-+        from hermes_constants import get_hermes_home
-+
-+        home = get_hermes_home()
-+    return Path(home) / RECORD_DIRNAME
-+
-+
-+def record_path(scope: DetourScope, home: Any = None) -> Path:
-+    return detour_root(home) / f"{scope.fingerprint()}.json"
-+
-+
-+def _lock_path(scope: DetourScope, home: Any = None) -> Path:
-+    return detour_root(home) / f"{scope.lane_fingerprint()}.lock"
-+
-+
-+def _flock(handle, *, lock: bool) -> None:
-+    if os.name == "nt":
-+        import msvcrt
-+
-+        handle.seek(0)
-+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
-+    else:
-+        import fcntl
-+
-+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
-+
-+
-+#: One mutex per lane fingerprint, so same-process concurrency (two gateway coroutines, two threads)
-+#: serializes even on a platform where advisory file locking is unavailable.
-+_LANE_MUTEXES: Dict[str, threading.Lock] = {}
-+_LANE_MUTEXES_GUARD = threading.Lock()
-+
-+
-+def _lane_mutex(scope: DetourScope) -> threading.Lock:
-+    key = scope.lane_fingerprint()
-+    with _LANE_MUTEXES_GUARD:
-+        mutex = _LANE_MUTEXES.get(key)
-+        if mutex is None:
-+            mutex = _LANE_MUTEXES[key] = threading.Lock()
-+        return mutex
-+
-+
-+class LaneTransitionLock:
-+    """The whole-transition lock for one conversation lane.
-+
-+    Explicit ``acquire``/``release`` rather than only a context manager, because an async surface
-+    must hold this across ``await``s (the session reset, the resume, the model switch) — a ``with``
-+    block cannot span them. Both calls are blocking and are meant to be run off the event loop via
-+    ``asyncio.to_thread``, so waiting for the lock never stalls the loop.
-+
-+    Two layers: a per-lane in-process mutex (``threading.Lock``, released from whichever thread
-+    ``release`` lands on) and an advisory lock on a lane file for the cross-process case.
-+
-+    Both layers are mandatory. :meth:`acquire` FAILS CLOSED — if the lane file cannot be opened or
-+    locked it raises :class:`LaneLockError` instead of running the transition on in-process ordering
-+    alone. Degrading was silently unsafe: two Hermes processes sharing a home would each read "no
-+    detour open" and each rotate the same lane, so one child session is orphaned and its record
-+    overwritten. A refused command loses nothing — the user can retry.
-+    """
-+
-+    def __init__(self, scope: DetourScope, home: Any = None) -> None:
-+        self._scope = scope
-+        self._home = home
-+        self._mutex = _lane_mutex(scope)
-+        self._mutex_held = False
-+        self._handle = None
-+
-+    def acquire(self) -> "LaneTransitionLock":
-+        self._mutex.acquire()
-+        self._mutex_held = True
-+        path = _lock_path(self._scope, self._home)
-+        try:
-+            path.parent.mkdir(parents=True, exist_ok=True)
-+            # Assigned BEFORE the flock, so a handle opened by a call that then fails to lock is
-+            # still closed below rather than leaked for the life of the process.
-+            self._handle = open(path, "a+b")
-+            _flock(self._handle, lock=True)
-+        except Exception:
-+            logger.warning("session_detour: lane lock refused for %s", path, exc_info=True)
-+            self.release()
-+            raise LaneLockError(LOCK_REFUSAL) from None
-+        return self
-+
-+    def release(self) -> None:
-+        handle, self._handle = self._handle, None
-+        if handle is not None:
-+            with suppress(Exception):
-+                _flock(handle, lock=False)
-+            with suppress(Exception):
-+                handle.close()
-+        if self._mutex_held:
-+            self._mutex_held = False
-+            with suppress(RuntimeError):
-+                self._mutex.release()
-+
-+    def __enter__(self) -> "LaneTransitionLock":
-+        return self.acquire()
-+
-+    def __exit__(self, *_exc) -> None:
-+        self.release()
-+
-+
-+@contextmanager
-+def scope_lock(scope: DetourScope, home: Any = None) -> Iterator[None]:
-+    """Serialize read-decide-write on one lane across processes (sync callers).
-+
-+    Both legs mutate the record after reading it; without this, two concurrent messages on the same
-+    channel could each see "no detour" and each rotate the session.
-+
-+    Raises :class:`LaneLockError` (before the body runs) when the lane cannot be locked — the caller
-+    reports it and changes nothing.
-+    """
-+    lock = LaneTransitionLock(scope, home).acquire()
-+    try:
-+        yield
-+    finally:
-+        lock.release()
-+
-+
-+def read_record(scope: DetourScope, home: Any = None) -> Optional[DetourRecord]:
-+    """The lane's record, or None when the lane has never detoured.
-+
-+    Raises :class:`DetourRecordError` when a file IS present but unusable — an unreadable,
-+    non-JSON, wrong-version, wrong-scope or malformed record is a fault to report, never a reason
-+    to start a session.
-+    """
-+    path = record_path(scope, home)
-+    try:
-+        raw = path.read_bytes()
-+    except FileNotFoundError:
-+        return None
-+    except OSError as exc:
-+        raise DetourRecordError(
-+            f"the detour record at {path} could not be read ({type(exc).__name__})") from None
-+    try:
-+        data = json.loads(raw.decode("utf-8-sig"))
-+    except (UnicodeDecodeError, ValueError):
-+        raise DetourRecordError(f"the detour record at {path} is not readable UTF-8 JSON") from None
-+    if not isinstance(data, dict):
-+        raise DetourRecordError(f"the detour record at {path} is not a JSON object")
-+
-+    version = data.get("version")
-+    if version != RECORD_VERSION:
-+        raise DetourRecordError(
-+            f"the detour record at {path} has unsupported version {version!r} "
-+            f"(this build writes {RECORD_VERSION})")
-+    status = data.get("status")
-+    if status not in _KNOWN_STATUSES:
-+        raise DetourRecordError(f"the detour record at {path} has an unknown status {status!r}")
-+    stored_scope = DetourScope.from_json(data.get("scope"))
-+    if stored_scope is None:
-+        raise DetourRecordError(f"the detour record at {path} has no readable scope")
-+    if stored_scope.parts != scope.parts:
-+        # The filename is a digest of the scope, so this means the file was moved or hand-edited.
-+        raise DetourRecordError(
-+            f"the detour record at {path} belongs to another conversation and was not used")
-+    parent = str(data.get("parent_session_id") or "")
-+    if not _SESSION_ID_RE.match(parent):
-+        raise DetourRecordError(
-+            f"the detour record at {path} names an invalid parent session id")
-+    child = str(data.get("child_session_id") or "")
-+    if child and not _SESSION_ID_RE.match(child):
-+        raise DetourRecordError(f"the detour record at {path} names an invalid child session id")
-+    return DetourRecord(
-+        scope=stored_scope, parent_session_id=parent, status=status, child_session_id=child,
-+        profile=str(data.get("profile") or ""), parent_route=data.get("parent_route"),
-+        child_route=data.get("child_route"), entered_at=str(data.get("entered_at") or ""),
-+        returned_at=str(data.get("returned_at") or ""), token=str(data.get("token") or ""),
-+        version=RECORD_VERSION,
-+    )
-+
-+
-+def write_record(record: DetourRecord, home: Any = None) -> Path:
-+    """Persist *record* atomically as indented UTF-8 JSON; returns the path written."""
-+    from utils import atomic_json_write
-+
-+    path = record_path(record.scope, home)
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+    atomic_json_write(path, record.to_json(), indent=2)
-+    return path
-+
-+
-+def delete_record(scope: DetourScope, home: Any = None, *, expected_token: Optional[str] = None) -> bool:
-+    """Remove the lane's record (enter-leg rollback only). True when a file was removed.
-+
-+    With *expected_token*, the file is removed ONLY when it is still the record that token owns —
-+    a rollback must never delete the record a *different*, already-succeeded detour just wrote.
-+    """
-+    path = record_path(scope, home)
-+    if expected_token is not None:
-+        try:
-+            current = read_record(scope, home)
-+        except DetourRecordError:
-+            current = None  # unreadable: a rollback may still clear its own failed attempt
-+        if current is not None and current.token and current.token != expected_token:
-+            logger.warning(
-+                "session_detour: refusing to delete %s — it belongs to another transition", path)
-+            return False
-+    try:
-+        path.unlink()
-+        return True
-+    except FileNotFoundError:
++        params = inspect.signature(handler).parameters
++    except (TypeError, ValueError):  # builtins / C callables have no introspectable signature
 +        return False
-+    except OSError:
-+        logger.warning("session_detour: could not remove %s", path, exc_info=True)
-+        return False
++    return "context" in params
 +
 +
-+def update_record(expected: DetourRecord, home: Any = None, **changes: Any) -> DetourRecord:
-+    """Compare-and-swap *expected* → ``replace(expected, **changes)`` on disk.
++def bind_plugin_command_context(handler: Callable, context: Any) -> Callable:
++    """Return *handler* with the dispatching surface's host *context* bound, when it wants one.
 +
-+    The durable record is the only authority for "is a detour open here", so every write after the
-+    first re-reads it and refuses when the on-disk state is no longer the one the caller decided
-+    against — another process ended this detour, or started a new one, in the meantime. Fail-closed:
-+    the caller reports and leaves the live record alone.
++    A plugin slash command handler is historically called as ``handler(raw_args)`` and gets no
++    access to the live session host, so commands that have to compose native session behavior
++    (start a session, resume one, switch the route) could only be written inside core. A handler
++    that declares ``def handler(raw_args, *, context=None)`` now receives:
++
++    ``surface``      ``"cli"`` or ``"gateway"``.
++    ``command``      the canonical command name as dispatched.
++    ``host``         the live ``HermesCLI`` / ``GatewayRunner`` instance.
++    ``session_key``  the surface's own session identity, when it has one.
++    ``event``        gateway only: the ``MessageEvent`` being dispatched.
++    ``source``       gateway only: the ``SessionSource`` it resolved to.
++
++    Handlers that do not declare ``context`` are returned unchanged and keep being called exactly
++    as before, so every pre-existing plugin command is unaffected. Surfaces with no host context
++    (e.g. the TUI RPC bridge) simply never bind one, and a context-taking handler sees ``None`` —
++    which it is expected to refuse, not guess around.
 +    """
-+    current = read_record(expected.scope, home)
-+    if current is None:
-+        raise DetourRecordError("the detour record vanished while the detour was in progress")
-+    if expected.token and current.token != expected.token:
-+        raise DetourRecordError(
-+            "another detour transition took over this conversation; nothing was overwritten")
-+    if current.status != expected.status or current.parent_session_id != expected.parent_session_id:
-+        raise DetourRecordError(
-+            f"the detour record changed while the detour was in progress "
-+            f"(expected {expected.status!r}, found {current.status!r})")
-+    updated = replace(current, **changes)
-+    write_record(updated, home)
-+    return updated
++    if not _handler_accepts_context(handler):
++        return handler
++
++    def _bound(raw_args: str = ""):
++        return handler(raw_args, context=context)
++
++    return _bound
 +
 +
-+def begin_detour(
-+    scope: DetourScope, *, parent_session_id: str, parent_route: Any = None, child_route: Any = None,
-+    home: Any = None,
-+) -> DetourRecord:
-+    """Write the ``entering`` record. Call BEFORE rotating the session, under :func:`scope_lock`."""
-+    if not _SESSION_ID_RE.match(str(parent_session_id or "")):
-+        raise DetourRecordError("the current session has no usable id to return to")
-+    record = DetourRecord(
-+        scope=scope, parent_session_id=str(parent_session_id), status=STATUS_ENTERING,
-+        profile=active_profile_name(), parent_route=parent_route, child_route=child_route,
-+        entered_at=_now(), token=uuid.uuid4().hex,
-+    )
-+    write_record(record, home)
-+    return record
-+
-+
-+def confirm_detour(record: DetourRecord, *, child_session_id: str, home: Any = None) -> DetourRecord:
-+    """Promote ``entering`` → ``active`` once the child session really exists.
-+
-+    Also writes the child→lane index, so a surface with no stable routing key can find this record
-+    again from the child session alone after a restart. Index first: a record that says ``active``
-+    while nothing can find it from the child side is the unrecoverable state.
-+    """
-+    if not _SESSION_ID_RE.match(str(child_session_id or "")):
-+        raise DetourRecordError("the new session reported no usable id")
-+    write_child_index(str(child_session_id), record.scope, home)
-+    return update_record(record, home, status=STATUS_ACTIVE, child_session_id=str(child_session_id))
-+
-+
-+def mark_returned(record: DetourRecord, home: Any = None) -> DetourRecord:
-+    """Consume the record — ONLY after the parent restore was observed in live state."""
-+    updated = update_record(record, home, status=STATUS_RETURNED, returned_at=_now())
-+    if record.child_session_id:
-+        delete_child_index(record.child_session_id, home)
-+    return updated
-+
-+
-+# --------------------------------------------------------------------- child → lane index
-+#
-+# The gateway has a stable lane key (``session_key``) and can always recompute its own record path.
-+# A CLI cannot: its only identity is the session id, and the enter leg rotates it. So the child side
-+# gets a one-line index file, written under a digest of the child session id, naming the lane whose
-+# record to load. It is a POINTER, never an authority: the record it names is still read through
-+# :func:`read_record` (scope must match) and still has to pass every gate in
-+# :func:`resolve_return_target`. That is what keeps this different from scanning the directory and
-+# trusting whatever record turns up.
-+
-+_CHILD_INDEX_VERSION = 1
-+
-+
-+def _child_index_path(child_session_id: str, home: Any = None) -> Path:
-+    digest = hashlib.sha256(f"child\x1f{child_session_id}".encode("utf-8")).hexdigest()[:40]
-+    return detour_root(home) / f"child-{digest}.json"
-+
-+
-+def write_child_index(child_session_id: str, scope: DetourScope, home: Any = None) -> Path:
-+    from utils import atomic_json_write
-+
-+    path = _child_index_path(child_session_id, home)
-+    path.parent.mkdir(parents=True, exist_ok=True)
-+    atomic_json_write(path, {
-+        "version": _CHILD_INDEX_VERSION, "child_session_id": str(child_session_id),
-+        "fingerprint": scope.fingerprint(), "scope": scope.to_json(),
-+    }, indent=2)
-+    return path
-+
-+
-+def scope_for_child(child_session_id: str, home: Any = None) -> Optional[DetourScope]:
-+    """The lane a child session detoured from, or None when there is no usable index entry."""
-+    child = str(child_session_id or "")
-+    if not child or not _SESSION_ID_RE.match(child):
-+        return None
-+    try:
-+        data = json.loads(_child_index_path(child, home).read_bytes().decode("utf-8-sig"))
-+    except FileNotFoundError:
-+        return None
-+    except (OSError, UnicodeDecodeError, ValueError):
-+        logger.debug("session_detour: child index for %s unreadable", child, exc_info=True)
-+        return None
-+    if not isinstance(data, dict) or data.get("version") != _CHILD_INDEX_VERSION:
-+        return None
-+    if str(data.get("child_session_id") or "") != child:
-+        return None  # index moved or hand-edited
-+    scope = DetourScope.from_json(data.get("scope"))
-+    if scope is None or scope.fingerprint() != str(data.get("fingerprint") or ""):
-+        return None
-+    return scope
-+
-+
-+def delete_child_index(child_session_id: str, home: Any = None) -> bool:
-+    try:
-+        _child_index_path(str(child_session_id), home).unlink()
-+        return True
-+    except (FileNotFoundError, OSError):
-+        return False
-+
-+
-+def is_abandoned_enter(record: Optional[DetourRecord], *, current_session_id: str) -> bool:
-+    """True when an ``entering`` record's rotation never happened.
-+
-+    The enter leg died between the record write and the session reset, so no child was ever
-+    created and the lane is still on the parent. There is nothing to return TO — but the open
-+    record would otherwise refuse every future ``/detour`` on this lane forever, so the return leg
-+    treats this one state as "clear it" rather than "restore".
-+    """
-+    return bool(
-+        record is not None
-+        and record.status == STATUS_ENTERING
-+        and not record.child_session_id
-+        and record.parent_session_id == str(current_session_id or "")
-+    )
-+
-+
-+def parse_route_args(args: str) -> tuple[Optional[Dict[str, str]], Optional[str]]:
-+    """``({model, provider}, None)`` for a detour's route arguments, or ``(None, error)``.
-+
-+    Parsing goes through the single-owner ``/model`` parser so a detour accepts exactly what
-+    ``/model`` accepts, on every surface. ``--global`` and ``--once`` are refused: a detour's route
-+    belongs to the detour session and must neither outlive it nor reach ``config.yaml``.
-+    """
-+    from hermes_cli.model_switch import parse_model_switch_args
-+
-+    text = (args or "").strip()
-+    if not text:
-+        return {"model": "", "provider": ""}, None
-+    request = parse_model_switch_args(text)
-+    if request.errors:
-+        return None, request.error_messages()[0]
-+    if request.is_global:
-+        return None, "a detour route is session-scoped; drop --global"
-+    if request.is_once:
-+        return None, "a detour route lasts for the detour; drop --once"
-+    return {"model": request.target or "", "provider": request.explicit_provider or ""}, None
-+
-+
-+def route_switch_command(route: Any) -> str:
-+    """The session-scoped ``/model`` command that applies *route*, or ``""`` for an empty route."""
-+    resolved = _route(route)
-+    if not (resolved["model"] or resolved["provider"]):
-+        return ""
-+    parts = [resolved["model"]] if resolved["model"] else []
-+    if resolved["provider"]:
-+        parts += ["--provider", resolved["provider"]]
-+    parts.append("--session")
-+    return "/model " + " ".join(parts)
-+
-+
-+def routes_match(requested: Any, effective: Any) -> bool:
-+    """True when *effective* (live runtime) satisfies *requested* (what the detour asked for).
-+
-+    Runtime truth is not string equality: ``/model sonnet`` may resolve to a fully-qualified id, and
-+    a provider-only switch auto-detects the model. So an empty requested field means "don't care",
-+    and a requested model is satisfied by an effective model that is the same name or contains it.
-+    Anything else — notably "nothing was applied at all" — is a mismatch, which is the case this
-+    exists to catch: a leg must never report success on the strength of the reply text.
-+    """
-+    want, got = _route(requested), _route(effective)
-+    if not (want["model"] or want["provider"]):
-+        return True
-+    if want["provider"] and want["provider"].casefold() != got["provider"].casefold():
-+        return False
-+    if want["model"]:
-+        wanted, actual = want["model"].casefold(), got["model"].casefold()
-+        if not actual or (wanted not in actual and actual not in wanted):
-+            return False
-+    return True
-+
-+
-+def resolve_return_target(
-+    record: Optional[DetourRecord], scope: DetourScope, *, current_session_id: str,
-+    session_exists: Any = None, lineage_parent: Optional[Callable[[str], Optional[str]]] = None,
-+) -> str:
-+    """The parent session id a return may restore, or raise :class:`DetourRecordError`.
-+
-+    Four independent gates, all fail-closed:
-+
-+    * an open record must exist (a missing or already-returned one is the caller's no-op case);
-+    * the record's scope must match the caller's lane (also checked in :func:`read_record`);
-+    * the caller must be sitting IN the recorded child session — this is what stops a different
-+      conversation in the same lane from using the record as a jump to the parent;
-+    * the parent session must still exist, per *session_exists* (a callable the surface supplies
-+      from its own session store).
-+    """
-+    if record is None or not record.is_open:
-+        raise DetourRecordError("no detour is open for this conversation")
-+    if record.scope.parts != scope.parts:
-+        raise DetourRecordError("the detour record belongs to another conversation")
-+    current = str(current_session_id or "")
-+    if record.child_session_id and current and record.child_session_id != current:
-+        raise DetourRecordError(
-+            f"this conversation ({current}) is not the detour's session "
-+            f"({record.child_session_id}); resume that session first")
-+    if not record.child_session_id and current and current != record.parent_session_id:
-+        # The enter leg rotated but never managed to bind the child id (a write failed, or the
-+        # process died between the two). Lineage is the fallback authority: the session store's own
-+        # parent link for THIS session must name the record's parent. Without that proof the record
-+        # is not usable from here — "some open record exists in this lane" is not identity.
-+        proven = str((lineage_parent(current) if lineage_parent else None) or "")
-+        if proven != record.parent_session_id:
-+            raise DetourRecordError(
-+                f"this conversation ({current}) is not the detour's session and its lineage does "
-+                f"not lead back to {record.parent_session_id}; resume that session first")
-+    target = record.parent_session_id
-+    if not _SESSION_ID_RE.match(target):
-+        raise DetourRecordError("the detour record names an invalid parent session id")
-+    if target == current:
-+        raise DetourRecordError("already on the detour's parent session")
-+    if session_exists is not None and not session_exists(target):
-+        raise DetourRecordError(f"the parent session {target} no longer exists")
-+    return target
+ _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
+ 
+ 
 diff --git a/hermes_cli/text_command_aliases.py b/hermes_cli/text_command_aliases.py
 new file mode 100644
 index 0000000000..425dbdb655
@@ -1587,29 +344,126 @@ index 0000000000..425dbdb655
 +    if not stripped or stripped.startswith("/"):
 +        return None
 +    return alias_table(config).get(stripped)
-diff --git a/tests/cli/test_slash_dispatch_table.py b/tests/cli/test_slash_dispatch_table.py
-index 5bf91fbb68..68856799d0 100644
---- a/tests/cli/test_slash_dispatch_table.py
-+++ b/tests/cli/test_slash_dispatch_table.py
-@@ -48,8 +48,10 @@ def test_registry_names_resolve_into_the_table():
-         assert cmd is not None and HermesCLI._slash_handler(cmd.name) is not None, name
-     # registry commands the CLI never handled inline must still fall through
-     dispatched = {c.name for c in COMMAND_REGISTRY if HermesCLI._slash_handler(c.name)}
--    # /login has no old branch; it resolves through the naming-convention fallback.
--    assert dispatched == set(OLD_CHAIN_COMMANDS) - {"exit"} | {"quit", "login"}
-+    # /login, /detour and /detour-end have no old branch; they resolve through the
-+    # naming-convention fallback to CLIDetourMixin / the login handler.
-+    assert dispatched == (set(OLD_CHAIN_COMMANDS) - {"exit"}
-+                          | {"quit", "login", "detour", "detour-end"})
- 
- 
- def _cli():
+diff --git a/tests/fakes/session_detours_plugin.py b/tests/fakes/session_detours_plugin.py
+new file mode 100644
+index 0000000000..3d5ded4709
+--- /dev/null
++++ b/tests/fakes/session_detours_plugin.py
+@@ -0,0 +1,108 @@
++"""Load the ``session-detours`` plugin the way Hermes loads it, for tests.
++
++The feature no longer lives in core, so the tests that own its contracts have to import it from
++the plugin payload in this checkout (``contrib/llm-cr-bundle/payload/plugins/session-detours``).
++The package is imported by file location under a stable module name, which is exactly what
++``hermes_cli.plugins_loader`` does, so the plugin's own relative imports resolve.
++
++``detour_cli(cli)`` / ``detour_gateway(runner)`` return the plugin's per-host surface adapter —
++the same object the registered ``/detour`` handler builds when a real CLI or gateway dispatches
++the command — so a test can drive the real leg against a real host.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import shutil
++import sys
++from pathlib import Path
++
++MODULE_NAME = "hermes_session_detours_plugin"
++
++
++def _plugin_dir() -> Path:
++    """Where the plugin source lives for this checkout.
++
++    In the checkout that *ships* the bundle it is the payload under ``contrib/``. A checkout that
++    only received the bundle (patch applied, payload installed into the Hermes home) has no
++    ``contrib/llm-cr-bundle``, so fall back to the installed copy — the same files, at the location
++    the installer wrote them to.
++    """
++    in_repo = (Path(__file__).resolve().parents[2]
++               / "contrib" / "llm-cr-bundle" / "payload" / "plugins" / "session-detours")
++    if (in_repo / "__init__.py").is_file():
++        return in_repo
++    from hermes_constants import get_hermes_home
++
++    return Path(get_hermes_home()) / "plugins" / "session-detours"
++
++
++PLUGIN_DIR = _plugin_dir()
++
++
++def load() -> object:
++    """The imported plugin package (cached in ``sys.modules`` after the first call)."""
++    existing = sys.modules.get(MODULE_NAME)
++    if existing is not None:
++        return existing
++    spec = importlib.util.spec_from_file_location(
++        MODULE_NAME, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)],
++    )
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[MODULE_NAME] = module
++    try:
++        spec.loader.exec_module(module)
++    except BaseException:
++        del sys.modules[MODULE_NAME]
++        raise
++    return module
++
++
++plugin = load()
++records = importlib.import_module(f"{MODULE_NAME}.detour_records")
++detour_cli = plugin._cli_adapter
++detour_gateway = plugin._gateway_adapter
++dispatch_detour = plugin._detour_command
++dispatch_detour_end = plugin._detour_end_command
++register = plugin.register
++
++# Re-export the record store's public names so a test imports them from one place
++# (``from tests.fakes.session_detours_plugin import DetourScope, read_record, ...``).
++globals().update({name: getattr(records, name)
++                  for name in dir(records) if not name.startswith("_")})
++
++
++def install_into_home(home: Path, *, enabled: bool = True):
++    """Install the plugin into *home* the way the bundle installer does, then discover it.
++
++    Copies the payload to ``<home>/plugins/session-detours`` and writes the ``plugins.enabled``
++    consent into ``<home>/config.yaml`` (user plugins are opt-in), so the slash commands come
++    from a real discovery pass over a real plugins directory — not from a hand-built registry.
++    With ``enabled=False`` the plugin is on disk but not consented, which is how a test asserts
++    that a disabled plugin means no ``/detour`` behavior at all.
++
++    Returns the live ``PluginManager``. The caller is responsible for restoring process-global
++    discovery state (see :func:`reset_discovery`).
++    """
++    target = Path(home) / "plugins" / "session-detours"
++    target.parent.mkdir(parents=True, exist_ok=True)
++    if target.exists():
++        shutil.rmtree(target)
++    shutil.copytree(PLUGIN_DIR, target, ignore=shutil.ignore_patterns("__pycache__", "tests"))
++
++    config = Path(home) / "config.yaml"
++    existing = config.read_text(encoding="utf-8") if config.exists() else ""
++    entries = "\n    - session-detours" if enabled else ""
++    config.write_text(f"{existing}\nplugins:\n  enabled:{entries or ' []'}\n  disabled: []\n",
++                      encoding="utf-8")
++
++    from hermes_cli import plugins as plugins_mod
++    reset_discovery()
++    return plugins_mod._ensure_plugins_discovered(force=True)
++
++
++def reset_discovery() -> None:
++    """Drop the process-global plugin manager so the next discovery starts from this home."""
++    from hermes_cli import plugins as plugins_mod
++
++    plugins_mod._reset_plugin_managers_for_tests()
 diff --git a/tests/gateway/test_detour_commands.py b/tests/gateway/test_detour_commands.py
 new file mode 100644
-index 0000000000..0d63bc4d93
+index 0000000000..70bb92433b
 --- /dev/null
 +++ b/tests/gateway/test_detour_commands.py
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,582 @@
 +"""``/detour`` + ``/detour-end`` on the gateway, against a real SessionStore and SessionDB.
 +
 +The runner is the real :class:`GatewayRunner` with only surface plumbing stubbed (adapters, hooks,
@@ -1630,7 +484,8 @@ index 0000000000..0d63bc4d93
 +from gateway.config import GatewayConfig, Platform, PlatformConfig
 +from gateway.platforms.event import MessageEvent
 +from gateway.session import SessionSource, SessionStore
-+from hermes_cli.session_detour import (
++from tests.fakes.session_detours_plugin import detour_gateway
++from tests.fakes.session_detours_plugin import (
 +    STATUS_ACTIVE,
 +    STATUS_ENTERING,
 +    STATUS_RETURNED,
@@ -1717,7 +572,7 @@ index 0000000000..0d63bc4d93
 +
 +def _scope(runner, source=None) -> DetourScope:
 +    source = source or _source()
-+    return runner._detour_scope(source, runner._session_key_for_source(source))
++    return detour_gateway(runner)._detour_scope(source, runner._session_key_for_source(source))
 +
 +
 +def _routed(runner, source=None) -> str:
@@ -1752,7 +607,7 @@ index 0000000000..0d63bc4d93
 +async def test_detour_rotates_to_a_fresh_empty_session_and_records_the_way_back(runner):
 +    parent = await _seed_parent(runner)
 +
-+    reply = await runner._handle_detour_command(_event("/detour some-model --provider some-provider"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model --provider some-provider"))
 +
 +    child = _routed(runner)
 +    assert child and child != parent
@@ -1772,11 +627,11 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_detour_end_returns_to_the_parent_with_its_own_history(runner):
 +    parent = await _seed_parent(runner, texts=("hello parent", "second parent turn"))
-+    await runner._handle_detour_command(_event("/detour some-model --provider some-provider"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour some-model --provider some-provider"))
 +    child = _routed(runner)
 +    runner.session_store.append_to_transcript(child, {"role": "user", "content": "child only"})
 +
-+    reply = await runner._handle_detour_end_command(_event("/detour-end back-model --provider back-provider"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end back-model --provider back-provider"))
 +
 +    assert _routed(runner) == parent
 +    assert parent in reply
@@ -1795,10 +650,10 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_the_child_never_sees_the_parents_history_in_either_direction(runner):
 +    parent = await _seed_parent(runner, texts=("parent secret",))
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +    runner.session_store.append_to_transcript(child, {"role": "user", "content": "child secret"})
-+    await runner._handle_detour_end_command(_event("/detour-end"))
++    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
 +    parent_texts = [m["content"] for m in runner.session_store.load_transcript(parent)]
 +    child_texts = [m["content"] for m in runner.session_store.load_transcript(child)]
@@ -1808,7 +663,7 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_bare_detour_switches_no_model_at_all(runner):
 +    await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    assert runner.applied_routes == []
 +    assert read_record(_scope(runner)).status == STATUS_ACTIVE
 +
@@ -1819,11 +674,11 @@ index 0000000000..0d63bc4d93
 +    """What the next inbound message resolves to — the native route, not just a stored id."""
 +    source = _source()
 +    parent = await _seed_parent(runner, source)
-+    await runner._handle_detour_command(_event("/detour", source))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour", source))
 +    child = _routed(runner, source)
 +    assert (await runner.async_session_store.get_or_create_session(source)).session_id == child
 +
-+    await runner._handle_detour_end_command(_event("/detour-end", source))
++    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end", source))
 +    assert (await runner.async_session_store.get_or_create_session(source)).session_id == parent
 +
 +
@@ -1836,13 +691,13 @@ index 0000000000..0d63bc4d93
 +
 +    runner._agent_cache[key] = ("stale-agent", "sig")
 +    runner._session_model_overrides[key] = {"model": "stale", "provider": "stale"}
-+    await runner._handle_detour_command(_event("/detour", source))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour", source))
 +    assert key not in runner._agent_cache
 +    assert not runner._session_model_overrides.get(key)
 +
 +    runner._agent_cache[key] = ("stale-child-agent", "sig")
 +    runner._session_model_overrides[key] = {"model": "child", "provider": "child"}
-+    await runner._handle_detour_end_command(_event("/detour-end", source))
++    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end", source))
 +    assert key not in runner._agent_cache
 +    # The child's override is gone (the resume cleared conversation scope) and the PARENT's own
 +    # route — the one the record saved at enter — is deliberately back: returning to a session
@@ -1854,10 +709,10 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_second_detour_neither_nests_nor_overwrites_the_record(runner):
 +    parent = await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child, before = _routed(runner), record_path(_scope(runner)).read_bytes()
 +
-+    reply = await runner._handle_detour_command(_event("/detour other-model"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour other-model"))
 +
 +    assert "already open" in reply
 +    assert _routed(runner) == child  # no second rotation
@@ -1869,10 +724,10 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_second_detour_end_is_a_quiet_no_op(runner):
 +    parent = await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
-+    await runner._handle_detour_end_command(_event("/detour-end"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
-+    reply = await runner._handle_detour_end_command(_event("/detour-end back-model"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end back-model"))
 +
 +    assert "Nothing to end" in reply
 +    assert _routed(runner) == parent  # still on the parent; nothing created or switched
@@ -1884,7 +739,7 @@ index 0000000000..0d63bc4d93
 +    parent = await _seed_parent(runner)
 +    sessions_before = _session_ids(runner)
 +
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
 +    assert "Nothing to end" in reply
 +    assert _routed(runner) == parent
@@ -1896,12 +751,12 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_corrupt_record_refuses_the_return_and_is_preserved(runner):
 +    parent = await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +    path = record_path(_scope(runner))
 +    path.write_bytes(b"{ truncated")
 +
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
 +    assert reply.startswith("❌")
 +    assert _routed(runner) == child  # fail closed: no switch, no new session
@@ -1912,13 +767,13 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_missing_parent_session_refuses_the_return_and_keeps_the_record(runner):
 +    await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +    record = read_record(_scope(runner))
 +    runner._session_db._db.delete_session(record.parent_session_id,
 +                                     sessions_dir=runner.home / "sessions")
 +
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
 +    assert "no longer exists" in reply
 +    assert _routed(runner) == child
@@ -1935,13 +790,13 @@ index 0000000000..0d63bc4d93
 +            return {"id": "whatever"}
 +
 +    await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +    runner._session_db = _AsyncOnly()
 +
-+    assert runner._detour_sync_session_db() is None
-+    assert runner._detour_session_exists(child) is False
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    assert detour_gateway(runner)._detour_sync_session_db() is None
++    assert detour_gateway(runner)._detour_session_exists(child) is False
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
 +    assert "no longer exists" in reply
 +    assert _routed(runner) == child
@@ -1956,7 +811,7 @@ index 0000000000..0d63bc4d93
 +        raise RuntimeError("reset exploded")
 +
 +    monkeypatch.setattr(runner, "_handle_reset_command", _boom)
-+    reply = await runner._handle_detour_command(_event("/detour some-model"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 +
 +    assert "Nothing changed" in reply
 +    assert _routed(runner) == parent
@@ -1967,14 +822,14 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_failed_resume_keeps_the_detour_open(runner, monkeypatch):
 +    await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +
 +    async def _refuse(_event):
 +        return "not allowed"
 +
 +    monkeypatch.setattr(runner, "_handle_resume_command", _refuse)
-+    reply = await runner._handle_detour_end_command(_event("/detour-end back-model"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end back-model"))
 +
 +    assert "stays open" in reply
 +    assert _routed(runner) == child
@@ -1991,7 +846,7 @@ index 0000000000..0d63bc4d93
 +        raise RuntimeError("provider unreachable")
 +
 +    runner._handle_model_command = _boom
-+    reply = await runner._handle_detour_command(_event("/detour some-model"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 +
 +    assert "Detour not started" in reply and "model switch failed" in reply
 +    assert _routed(runner) == parent  # back on the original conversation
@@ -2004,7 +859,7 @@ index 0000000000..0d63bc4d93
 +    parent = await _seed_parent(runner)
 +    runner.model_switch_is_broken = True
 +
-+    reply = await runner._handle_detour_command(_event("/detour some-model"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 +
 +    assert "Detour not started" in reply and "did not take effect" in reply
 +    assert _routed(runner) == parent
@@ -2014,7 +869,7 @@ index 0000000000..0d63bc4d93
 +def _break_the_lane_lock(monkeypatch):
 +    """No advisory lock obtainable. Returns the switch so a test can let it work again without
 +    ``monkeypatch.undo`` (which would also undo the runner fixture's patches)."""
-+    import hermes_cli.session_detour as detour_mod
++    from tests.fakes.session_detours_plugin import records as detour_mod
 +
 +    broken = {"on": True}
 +    real_flock = detour_mod._flock
@@ -2037,7 +892,7 @@ index 0000000000..0d63bc4d93
 +    rows_before = _session_ids(runner)
 +    _break_the_lane_lock(monkeypatch)
 +
-+    reply = await runner._handle_detour_command(_event("/detour some-model"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 +
 +    assert "Detour not started" in reply and "could not be locked" in reply
 +    assert _routed(runner) == parent
@@ -2050,11 +905,11 @@ index 0000000000..0d63bc4d93
 +async def test_a_lane_that_cannot_be_locked_refuses_the_return_leg_and_keeps_the_detour(
 +        runner, monkeypatch):
 +    await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +    _break_the_lane_lock(monkeypatch)
 +
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +
 +    assert "Could not end the detour" in reply and "could not be locked" in reply
 +    assert _routed(runner) == child  # no resume, no switch
@@ -2066,16 +921,16 @@ index 0000000000..0d63bc4d93
 +    """A refusal must not wedge the lane — the retry is an ordinary round trip."""
 +    parent = await _seed_parent(runner)
 +    broken = _break_the_lane_lock(monkeypatch)
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    assert _routed(runner) == parent
 +
 +    broken["on"] = False
-+    await runner._handle_detour_command(_event("/detour"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    child = _routed(runner)
 +    assert child and child != parent
 +    assert read_record(_scope(runner)).status == STATUS_ACTIVE
 +
-+    await runner._handle_detour_end_command(_event("/detour-end"))
++    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +    assert _routed(runner) == parent
 +    assert read_record(_scope(runner)).status == STATUS_RETURNED
 +
@@ -2084,7 +939,7 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.parametrize("args", ["some-model --global", "some-model --once"])
 +async def test_a_route_that_would_outlive_the_detour_is_refused_before_anything_happens(runner, args):
 +    parent = await _seed_parent(runner)
-+    reply = await runner._handle_detour_command(_event(f"/detour {args}"))
++    reply = await detour_gateway(runner)._handle_detour_command(_event(f"/detour {args}"))
 +    assert reply.startswith("❌")
 +    assert _routed(runner) == parent
 +    assert not record_path(_scope(runner)).exists()
@@ -2097,10 +952,10 @@ index 0000000000..0d63bc4d93
 +    my_parent = await _seed_parent(runner, mine)
 +    their_parent = await _seed_parent(runner, theirs, texts=("their parent",))
 +
-+    await runner._handle_detour_command(_event("/detour", mine))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour", mine))
 +    # The other lane has no record at all, so its /detour-end is a no-op on its own session.
 +    assert read_record(_scope(runner, theirs)) is None
-+    reply = await runner._handle_detour_end_command(_event("/detour-end", theirs))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end", theirs))
 +    assert "Nothing to end" in reply
 +    assert _routed(runner, theirs) == their_parent
 +    # ...and my detour is still open, pointing at my parent.
@@ -2110,7 +965,7 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_a_cli_record_cannot_be_used_by_the_gateway_lane(runner):
 +    """Cross-surface isolation: same owner, different surface, different record."""
-+    from hermes_cli.session_detour import begin_detour
++    from tests.fakes.session_detours_plugin import begin_detour
 +
 +    await _seed_parent(runner)
 +    gateway_scope = _scope(runner)
@@ -2119,7 +974,7 @@ index 0000000000..0d63bc4d93
 +
 +    assert record_path(cli_scope) != record_path(gateway_scope)
 +    assert read_record(gateway_scope) is None
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +    assert "Nothing to end" in reply
 +
 +
@@ -2132,7 +987,7 @@ index 0000000000..0d63bc4d93
 +
 +    source = _source()
 +    parent = await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour", source))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour", source))
 +    child = _routed(runner)
 +
 +    fresh = object.__new__(GatewayRunner)
@@ -2147,7 +1002,7 @@ index 0000000000..0d63bc4d93
 +    fresh._handle_model_command = runner._handle_model_command
 +
 +    assert _routed(fresh, source) == child  # the lane still routes to the detour session
-+    reply = await fresh._handle_detour_end_command(_event("/detour-end", source))
++    reply = await detour_gateway(fresh)._handle_detour_end_command(_event("/detour-end", source))
 +    assert _routed(fresh, source) == parent, reply
 +    assert read_record(_scope(fresh)).status == STATUS_RETURNED
 +
@@ -2160,7 +1015,7 @@ index 0000000000..0d63bc4d93
 +        "base_url": "http://host/v1",
 +    }
 +    await _seed_parent(runner)
-+    await runner._handle_detour_command(_event("/detour child-model --provider child-provider"))
++    await detour_gateway(runner)._handle_detour_command(_event("/detour child-model --provider child-provider"))
 +
 +    text = record_path(_scope(runner)).read_text(encoding="utf-8")
 +    assert "sk-leak" not in text
@@ -2175,22 +1030,366 @@ index 0000000000..0d63bc4d93
 +@pytest.mark.asyncio
 +async def test_an_interrupted_enter_leaves_a_returnable_entering_record(runner):
 +    """Crash between the record write and the rotation: the parent id is already durable."""
-+    from hermes_cli.session_detour import begin_detour
++    from tests.fakes.session_detours_plugin import begin_detour
 +
 +    parent = await _seed_parent(runner)
 +    begin_detour(_scope(runner), parent_session_id=parent)
 +    assert read_record(_scope(runner)).status == STATUS_ENTERING
 +
 +    # A later /detour refuses (the record is open) rather than nesting.
-+    assert "already open" in await runner._handle_detour_command(_event("/detour"))
++    assert "already open" in await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    # The return leg clears it instead of wedging the lane, and changes no session.
-+    reply = await runner._handle_detour_end_command(_event("/detour-end"))
++    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 +    assert "never started" in reply
 +    assert _routed(runner) == parent
 +    assert read_record(_scope(runner)).status == STATUS_RETURNED
 +    # ...and a fresh detour is possible again.
-+    assert "already open" not in await runner._handle_detour_command(_event("/detour"))
++    assert "already open" not in await detour_gateway(runner)._handle_detour_command(_event("/detour"))
 +    assert _routed(runner) != parent
+diff --git a/tests/gateway/test_detour_plugin_dispatch.py b/tests/gateway/test_detour_plugin_dispatch.py
+new file mode 100644
+index 0000000000..518c1ae313
+--- /dev/null
++++ b/tests/gateway/test_detour_plugin_dispatch.py
+@@ -0,0 +1,338 @@
++"""``/detour`` as a plugin command on the gateway's own dispatch paths.
++
++Where ``test_detour_commands.py`` drives the feature's surface leg directly, this file drives the
++GATEWAY: ``_hm_dispatch_quick_and_plugin_commands`` (the cold path), ``_hm_busy_slash_or_photo``
++(the mid-run fast path) and ``_hm_unknown_slash_reply`` (what a user sees when the feature is off).
++The plugin is really installed into a temp home and really discovered, so the handler these paths
++find is the one a production discovery pass would find.
++
++The guards asserted here are the ones that stopped being built-in guards when ``/detour`` stopped
++being a built-in: the slash-access gate, the busy rejection, and the unknown-command notice that
++keeps a disabled feature from reaching the LLM as free text. Each "refused" case also asserts that
++nothing happened — no new session row, no return record — because a guard that refuses after the
++session has already rotated is not a guard.
++"""
++
++import pytest
++
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.session import SessionSource
++from tests.fakes.session_detours_plugin import STATUS_ACTIVE, read_record
++from tests.gateway.test_detour_commands import (  # noqa: F401  (fixture import)
++    _event,
++    _routed,
++    _scope,
++    _seed_parent,
++    _session_ids,
++    _source,
++    runner,
++)
++
++
++@pytest.fixture
++def installed_plugin(runner):  # noqa: F811
++    """The ``session-detours`` plugin installed into the runner's temp home and discovered."""
++    from tests.fakes import session_detours_plugin as sdp
++
++    manager = sdp.install_into_home(runner.home)
++    yield manager
++    sdp.reset_discovery()
++
++
++@pytest.fixture
++def disabled_plugin(runner):  # noqa: F811
++    """The plugin on disk but not consented — the "feature off" state."""
++    from tests.fakes import session_detours_plugin as sdp
++
++    manager = sdp.install_into_home(runner.home, enabled=False)
++    yield manager
++    sdp.reset_discovery()
++
++
++def _gate_slash_commands(runner, *, admin_ids=("admin",), user_allowed=()):  # noqa: F811
++    """Turn on per-platform slash gating for this runner's platform (DM scope)."""
++    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(
++        enabled=True, token="***",
++        extra={"allow_admin_from": list(admin_ids),
++               "user_allowed_commands": list(user_allowed)})})
++
++
++async def _dispatch(runner, event):  # noqa: F811
++    """The gateway's real cold-path plugin dispatch → ``(handled, result)``."""
++    handled, result, _command = await runner._hm_dispatch_quick_and_plugin_commands(
++        event, event.source, event.get_command())
++    return handled, result
++
++
++# ------------------------------------------------------------------- the cold path, end to end
++@pytest.mark.asyncio
++async def test_the_gateway_dispatches_detour_to_the_plugin_and_the_lane_rotates(
++    runner, installed_plugin,  # noqa: F811
++):
++    parent = await _seed_parent(runner)
++
++    handled, result = await _dispatch(runner, _event("/detour side-model --provider side-provider"))
++
++    assert handled is True
++    assert result and "❌" not in result
++    child = _routed(runner)
++    assert child and child != parent
++    record = read_record(_scope(runner))
++    assert (record.status, record.parent_session_id, record.child_session_id) == (
++        STATUS_ACTIVE, parent, child)
++    assert runner.applied_routes == ["/model side-model --provider side-provider --session"]
++
++
++@pytest.mark.asyncio
++async def test_the_underscored_autocomplete_form_reaches_the_same_handler(
++    runner, installed_plugin,  # noqa: F811
++):
++    """Telegram offers ``/detour_end``; it must resolve to the hyphenated registration."""
++    parent = await _seed_parent(runner)
++    await _dispatch(runner, _event("/detour"))
++    assert _routed(runner) != parent
++
++    handled, result = await _dispatch(runner, _event("/detour_end"))
++
++    assert handled is True
++    assert result and "❌" not in result
++    assert _routed(runner) == parent
++
++
++@pytest.mark.asyncio
++async def test_the_handler_receives_this_gateway_and_this_lane_as_its_context(
++    runner, installed_plugin,  # noqa: F811
++):
++    """The context the surface binds is the live host, the routed session key and the event."""
++    from hermes_cli.plugins import bind_plugin_command_context, get_plugin_command_handler
++
++    seen = {}
++
++    def _probe(raw_args="", *, context=None):
++        seen.update(context or {})
++        return "probed"
++
++    assert get_plugin_command_handler("detour") is not None  # the real registration exists
++    source = _source()
++    event = _event("/detour x", source)
++    bound = bind_plugin_command_context(_probe, {
++        "surface": "gateway", "command": "detour", "host": runner,
++        "session_key": runner._plugin_command_session_key(source),
++        "event": event, "source": source,
++    })
++    assert bound("x") == "probed"
++    assert seen["host"] is runner and seen["event"] is event and seen["surface"] == "gateway"
++    assert seen["session_key"] == runner._session_key_for_source(
++        runner._normalize_source_for_session_key(source))
++
++
++# --------------------------------------------------------------------------- the access gate
++@pytest.mark.asyncio
++async def test_a_non_admin_is_refused_before_the_lane_moves(runner, installed_plugin):  # noqa: F811
++    parent = await _seed_parent(runner)
++    _gate_slash_commands(runner)
++    before = _session_ids(runner)
++
++    handled, result = await _dispatch(runner, _event("/detour side-model", _source(user="nobody")))
++
++    assert handled is True
++    assert result and result.startswith("⛔")
++    # Refused BEFORE any effect: same routed session, no new session row, no record at all.
++    assert _routed(runner) == parent
++    assert _session_ids(runner) == before
++    assert read_record(_scope(runner, _source(user="nobody"))) is None
++    assert runner.applied_routes == []
++
++
++@pytest.mark.asyncio
++async def test_the_underscored_form_is_gated_too(runner, installed_plugin):  # noqa: F811
++    """The cold-path gate runs on the typed name, so the normalized name is re-checked here."""
++    parent = await _seed_parent(runner)
++    _gate_slash_commands(runner)
++
++    handled, result = await _dispatch(runner, _event("/detour_end", _source(user="nobody")))
++
++    assert handled is True and result.startswith("⛔")
++    assert _routed(runner) == parent
++
++
++@pytest.mark.asyncio
++async def test_an_admin_passes_the_gate(runner, installed_plugin):  # noqa: F811
++    parent = await _seed_parent(runner, source=_source(user="admin"))
++    _gate_slash_commands(runner)
++
++    handled, result = await _dispatch(runner, _event("/detour", _source(user="admin")))
++
++    assert handled is True and "⛔" not in (result or "")
++    assert _routed(runner, _source(user="admin")) != parent
++
++
++@pytest.mark.asyncio
++async def test_an_explicitly_allowed_non_admin_passes_the_gate(runner, installed_plugin):  # noqa: F811
++    parent = await _seed_parent(runner, source=_source(user="helper"))
++    _gate_slash_commands(runner, user_allowed=("detour",))
++
++    handled, result = await _dispatch(runner, _event("/detour", _source(user="helper")))
++
++    assert handled is True and "⛔" not in (result or "")
++    assert _routed(runner, _source(user="helper")) != parent
++
++
++# ------------------------------------------------------------------------- the busy fast path
++@pytest.mark.asyncio
++async def test_a_detour_is_refused_mid_run_instead_of_interrupting_the_turn(
++    runner, installed_plugin,  # noqa: F811
++):
++    parent = await _seed_parent(runner)
++    before = _session_ids(runner)
++    key = runner._session_key_for_source(_source())
++
++    handled, result = await runner._hm_busy_slash_or_photo(_event("/detour side-model"), _source(), key)
++
++    assert handled is True
++    assert "can't run" in result and "/detour" in result
++    # Nothing ran: the lane is where it was, no session was created, no record was opened.
++    assert _routed(runner) == parent
++    assert _session_ids(runner) == before
++    assert read_record(_scope(runner)) is None
++    assert runner.applied_routes == []
++
++
++@pytest.mark.asyncio
++async def test_the_busy_refusal_covers_the_return_leg_and_its_underscored_form(
++    runner, installed_plugin,  # noqa: F811
++):
++    await _seed_parent(runner)
++    key = runner._session_key_for_source(_source())
++
++    for text in ("/detour-end", "/detour_end"):
++        handled, result = await runner._hm_busy_slash_or_photo(_event(text), _source(), key)
++        assert handled is True, text
++        assert "can't run" in result, text
++
++
++@pytest.mark.asyncio
++async def test_the_busy_path_checks_access_before_it_even_explains_the_refusal(
++    runner, installed_plugin,  # noqa: F811
++):
++    """A non-admin gets the denial, not the busy notice — the gate is not bypassable mid-run."""
++    await _seed_parent(runner)
++    _gate_slash_commands(runner)
++    source = _source(user="nobody")
++    key = runner._session_key_for_source(source)
++
++    handled, result = await runner._hm_busy_slash_or_photo(_event("/detour"), source, key)
++
++    assert handled is True and result.startswith("⛔")
++
++
++@pytest.mark.asyncio
++async def test_a_command_the_plugin_did_not_declare_is_left_to_the_normal_busy_path(
++    runner, installed_plugin,  # noqa: F811
++):
++    """The busy fast path must only claim commands that really declared ``reject``."""
++    await _seed_parent(runner)
++    key = runner._session_key_for_source(_source())
++
++    handled, result = await runner._hm_busy_slash_or_photo(_event("/not-a-command"), _source(), key)
++
++    assert (handled, result) == (False, None)
++
++
++# ------------------------------------------------------------------ the feature switched off
++@pytest.mark.asyncio
++async def test_a_disabled_plugin_means_no_detour_dispatch_at_all(runner, disabled_plugin):  # noqa: F811
++    parent = await _seed_parent(runner)
++    before = _session_ids(runner)
++
++    handled, result = await _dispatch(runner, _event("/detour side-model"))
++
++    assert (handled, result) == (False, None)
++    assert _routed(runner) == parent
++    assert _session_ids(runner) == before
++    assert read_record(_scope(runner)) is None
++
++
++@pytest.mark.asyncio
++async def test_a_disabled_plugin_also_leaves_the_busy_fast_path_alone(runner, disabled_plugin):  # noqa: F811
++    await _seed_parent(runner)
++    key = runner._session_key_for_source(_source())
++
++    handled, result = await runner._hm_busy_slash_or_photo(_event("/detour"), _source(), key)
++
++    assert (handled, result) == (False, None)
++
++
++@pytest.mark.asyncio
++async def test_a_bare_alias_for_a_disabled_detour_fails_loudly_and_never_reaches_the_llm(
++    runner, disabled_plugin,  # noqa: F811
++):
++    """``llm-cr`` rewrites to ``/detour``; with the feature off that must be an error, not a prompt.
++
++    This is the case that would be worst to get wrong: a slash command nobody handles, forwarded
++    to the model as ordinary text, becomes an invented answer about a detour that never happened.
++    """
++    for command in ("detour", "detour-end"):
++        reply = runner._hm_unknown_slash_reply(command, _source())
++        assert reply is not None, command
++        assert f"Unknown command `/{command}`" in reply
++
++
++@pytest.mark.asyncio
++async def test_an_enabled_detour_never_reaches_that_notice(runner, installed_plugin):  # noqa: F811
++    """With the plugin on, plugin dispatch claims the command first, so the notice is never asked.
++
++    ``_hm_unknown_slash_reply`` itself only knows the built-in registry — it would still call an
++    enabled ``/detour`` unknown if it were consulted. It isn't: this is the ordering the enabled
++    feature depends on, so assert the ordering rather than the stale lookup.
++    """
++    await _seed_parent(runner)
++
++    handled, _result = await _dispatch(runner, _event("/detour"))
++
++    assert handled is True
++
++
++# ------------------------------------------------------------ the rest of the gateway is intact
++@pytest.mark.asyncio
++async def test_the_native_session_commands_are_still_the_gateways_own(runner, installed_plugin):  # noqa: F811
++    """The plugin composes native handlers; it must not have replaced or wrapped any of them."""
++    from gateway.run import GatewayRunner
++
++    for name in ("_handle_reset_command", "_handle_resume_command", "_handle_model_command",
++                 "reset_session", "switch_session"):
++        if name == "_handle_model_command":
++            continue  # the fixture's own offline stand-in
++        assert getattr(type(runner), name, None) is getattr(GatewayRunner, name, None), name
++    # /new and /resume are still built-ins with their own registry entries.
++    from hermes_cli.commands import resolve_command
++    assert resolve_command("new") is not None and resolve_command("resume") is not None
++    # ...and /detour is not one, on either surface.
++    assert resolve_command("detour") is None and resolve_command("detour-end") is None
++
++
++@pytest.mark.asyncio
++async def test_a_plugin_command_without_a_context_parameter_still_dispatches(runner):  # noqa: F811
++    """Backwards compatibility on the real gateway path, not just at the binder."""
++    from hermes_cli import plugins as plugins_mod
++
++    plugin_dir = runner.home / "plugins" / "legacy-plugin"
++    plugin_dir.mkdir(parents=True)
++    (plugin_dir / "plugin.yaml").write_text(
++        'name: legacy-plugin\nversion: "1.0.0"\ndescription: "legacy"\n', encoding="utf-8")
++    (plugin_dir / "__init__.py").write_text(
++        'def _handler(raw_args=""):\n'
++        '    return "legacy ran with " + repr(raw_args)\n\n\n'
++        'def register(ctx):\n'
++        '    ctx.register_command("legacy-cmd", _handler, description="legacy")\n',
++        encoding="utf-8")
++    (runner.home / "config.yaml").write_text(
++        "plugins:\n  enabled:\n    - legacy-plugin\n  disabled: []\n", encoding="utf-8")
++    plugins_mod._reset_plugin_managers_for_tests()
++    plugins_mod._ensure_plugins_discovered(force=True)
++    try:
++        handled, result = await _dispatch(runner, _event("/legacy-cmd hello there"))
++    finally:
++        plugins_mod._reset_plugin_managers_for_tests()
++
++    assert (handled, result) == (True, "legacy ran with 'hello there'")
 diff --git a/tests/gateway/test_text_command_alias_deployed_plugin.py b/tests/gateway/test_text_command_alias_deployed_plugin.py
 new file mode 100644
 index 0000000000..ed9f652d32
@@ -2225,11 +1424,11 @@ index 0000000000..ed9f652d32
 +from gateway.session import AsyncSessionStore, SessionSource
 +
 +ENTER = "/model model-x --provider alpha-direct --session"
-+EXIT = "/model exit-model-900k --provider beta-direct --session"
++EXIT = "/model gpt-6-astra-900k --provider beta-direct --session"
 +
 +CONFIG = {
 +    "plugins": {"enabled": ["text-command-aliases"]},
-+    "model": {"default": "exit-model-900k", "provider": "beta-direct"},
++    "model": {"default": "gpt-6-astra-900k", "provider": "beta-direct"},
 +    "providers": {
 +        "alpha-direct": {
 +            "name": "alpha-direct", "base_url": "http://alpha.invalid/v1",
@@ -2239,7 +1438,7 @@ index 0000000000..ed9f652d32
 +        "beta-direct": {
 +            "name": "beta-direct", "base_url": "http://beta.invalid/v1",
 +            "api_key": "beta-test-key", "api_mode": "chat_completions",
-+            "models": {"exit-model-900k": {"context_length": 131072}},
++            "models": {"gpt-6-astra-900k": {"context_length": 131072}},
 +        },
 +    },
 +    "text_command_aliases": {
@@ -2376,7 +1575,7 @@ index 0000000000..ed9f652d32
 +    _handled, _reply, session_key, _event_in = await _submit(runner, "llm-cr")
 +
 +    model, runtime_kwargs = runner._apply_session_model_override(
-+        session_key, "exit-model-900k", {})
++        session_key, "gpt-6-astra-900k", {})
 +
 +    assert model == "model-x"
 +    assert runtime_kwargs["base_url"] == CONFIG["providers"]["alpha-direct"]["base_url"]
@@ -2424,7 +1623,7 @@ index 0000000000..ed9f652d32
 +
 +    assert runner._session_model_overrides[session_key]["model"] == "model-x"
 +    assert runner.session_store.overrides[session_key]["model"] == "model-x"
-+    assert runner._apply_session_model_override(session_key, "exit-model-900k", {})[0] == "model-x"
++    assert runner._apply_session_model_override(session_key, "gpt-6-astra-900k", {})[0] == "model-x"
 +    runner._run_agent.assert_not_awaited()
 +
 +
@@ -2488,7 +1687,7 @@ index 0000000000..778d9e68ba
 +from gateway.session import SessionSource
 +
 +SWITCH_IN = "/model hf.co/vendor/Some-Model-GGUF:Q4_K_M --provider local-direct --session"
-+SWITCH_OUT = "/model exit-model-900k --provider exit-direct --session"
++SWITCH_OUT = "/model gpt-6-astra-900k --provider openai-codex --session"
 +
 +# Mirrors ``$HERMES_HOME/plugins/text-command-aliases/__init__.py``: the shared matcher over the
 +# shared config section, skipping events that may not control the gateway.
@@ -2654,11 +1853,11 @@ index 0000000000..da96d83f07
 +from gateway.session import AsyncSessionStore, SessionSource
 +
 +ENTER = "/model model-x --provider alpha-direct --session"
-+EXIT = "/model exit-model-900k --provider beta-direct --session"
++EXIT = "/model gpt-6-astra-900k --provider beta-direct --session"
 +BROKEN = "/model model-x --provider no-such-provider --session"
 +
 +CONFIG = {
-+    "model": {"default": "exit-model-900k", "provider": "beta-direct"},
++    "model": {"default": "gpt-6-astra-900k", "provider": "beta-direct"},
 +    "providers": {
 +        "alpha-direct": {
 +            "name": "alpha-direct", "base_url": "http://alpha.invalid/v1",
@@ -2668,7 +1867,7 @@ index 0000000000..da96d83f07
 +        "beta-direct": {
 +            "name": "beta-direct", "base_url": "http://beta.invalid/v1",
 +            "api_key": "beta-test-key", "api_mode": "chat_completions",
-+            "models": {"exit-model-900k": {"context_length": 131072}},
++            "models": {"gpt-6-astra-900k": {"context_length": 131072}},
 +        },
 +    },
 +}
@@ -2781,7 +1980,7 @@ index 0000000000..da96d83f07
 +    await runner._handle_model_command(_event(EXIT, chat_id="chat-b"))
 +
 +    assert runner._session_model_overrides["whatsapp:chat-a"]["model"] == "model-x"
-+    assert runner._session_model_overrides["whatsapp:chat-b"]["model"] == "exit-model-900k"
++    assert runner._session_model_overrides["whatsapp:chat-b"]["model"] == "gpt-6-astra-900k"
 +
 +
 +@pytest.mark.asyncio
@@ -2798,10 +1997,10 @@ index 0000000000..da96d83f07
 +    assert runner._session_model_overrides["whatsapp:chat-a"]["provider"] == "alpha-direct"
 diff --git a/tests/hermes_cli/test_cli_detour.py b/tests/hermes_cli/test_cli_detour.py
 new file mode 100644
-index 0000000000..9f5fc9000a
+index 0000000000..5d8a69f824
 --- /dev/null
 +++ b/tests/hermes_cli/test_cli_detour.py
-@@ -0,0 +1,669 @@
+@@ -0,0 +1,809 @@
 +"""``/detour`` + ``/detour-end`` on the interactive CLI, against a real SessionDB.
 +
 +The object under test is a real :class:`HermesCLI` whose session plumbing is production code:
@@ -2827,11 +2026,13 @@ index 0000000000..9f5fc9000a
 +
 +import os
 +from datetime import datetime
++from pathlib import Path
 +from unittest.mock import MagicMock
 +
 +import pytest
 +
-+from hermes_cli.session_detour import (
++from tests.fakes.session_detours_plugin import detour_cli
++from tests.fakes.session_detours_plugin import (
 +    STATUS_ACTIVE,
 +    STATUS_RETURNED,
 +    DetourScope,
@@ -2895,6 +2096,26 @@ index 0000000000..9f5fc9000a
 +
 +    os.environ.pop("HERMES_SESSION_ID", None)
 +    _VAR_MAP["HERMES_SESSION_ID"].set(_UNSET)
++
++
++@pytest.fixture
++def installed_plugin(_isolated_home):
++    """The ``session-detours`` plugin really installed into this temp home and discovered."""
++    from tests.fakes import session_detours_plugin as sdp
++
++    manager = sdp.install_into_home(_isolated_home)
++    yield manager
++    sdp.reset_discovery()
++
++
++@pytest.fixture
++def disabled_plugin(_isolated_home):
++    """The plugin on disk but NOT consented — the "feature off" state."""
++    from tests.fakes import session_detours_plugin as sdp
++
++    manager = sdp.install_into_home(_isolated_home, enabled=False)
++    yield manager
++    sdp.reset_discovery()
 +
 +
 +@pytest.fixture
@@ -2972,7 +2193,8 @@ index 0000000000..9f5fc9000a
 +    """The lane a CLI detour from *parent_session_id* belongs to, recomputed the way production does
 +    (``_os_user`` degrades to ``""`` when the environment names no user — as it does under the
 +    hermetic test env — which is a scope component, not an identity check)."""
-+    from hermes_cli.cli_detour_mixin import _os_user
++    from tests.fakes.session_detours_plugin import plugin as _sdp
++    from hermes_session_detours_plugin.cli_surface import _os_user  # noqa: F401
 +
 +    return DetourScope(surface="cli", channel="local", owner=_os_user(), lane=parent_session_id)
 +
@@ -2999,7 +2221,7 @@ index 0000000000..9f5fc9000a
 +    parent = _new_session_id("par001")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +
-+    cli._handle_detour_command("/detour child-model --provider child-provider")
++    detour_cli(cli)._handle_detour_command("/detour child-model --provider child-provider")
 +
 +    child = cli.session_id
 +    assert child and child != parent
@@ -3021,7 +2243,7 @@ index 0000000000..9f5fc9000a
 +    parent = _new_session_id("par002")
 +    cli = _make_cli(db, parent, texts=("hello parent", "parent reply"))
 +
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    row = db.get_session(parent)
 +    assert row is not None  # ended, not deleted
@@ -3032,7 +2254,7 @@ index 0000000000..9f5fc9000a
 +    parent = _new_session_id("par003")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +
-+    cli._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_command("/detour")
 +
 +    assert cli.session_id != parent
 +    assert cli.applied_routes == []
@@ -3041,8 +2263,13 @@ index 0000000000..9f5fc9000a
 +    assert read_record(_scope(parent)).status == STATUS_ACTIVE
 +
 +
-+def test_detour_is_reachable_through_the_real_slash_dispatch_and_bare_alias(db):
-+    """Ingress: the configured bare alias resolves to ``/detour ...`` and the CLI dispatches it."""
++def test_detour_is_reachable_through_the_real_slash_dispatch_and_bare_alias(db, installed_plugin):
++    """Ingress, end to end: bare alias -> ``/detour ...`` -> the CLI's own plugin-command dispatch.
++
++    Nothing here knows the feature lives in a plugin. ``process_command`` resolves ``/detour``
++    through the same path any unregistered slash command takes (``_process_unregistered_slash`` ->
++    ``_run_plugin_slash_command``), which binds this CLI as the handler's host context.
++    """
 +    from hermes_cli.text_command_aliases import resolve_text_command_alias
 +
 +    parent = _new_session_id("par004")
@@ -3052,8 +2279,12 @@ index 0000000000..9f5fc9000a
 +        "aliases": {"llm-cr": "/detour child-model --provider child-provider",
 +                    "llm-cr-end": "/detour-end back-model --provider back-provider"}}}
 +
-+    assert cli._slash_handler("detour") == ("_handle_detour_command", True)
-+    assert cli._slash_handler("detour-end") == ("_handle_detour_end_command", True)
++    # /detour is no longer a built-in: it resolves only because the plugin registered it.
++    from hermes_cli.commands import resolve_command
++    assert resolve_command("detour") is None
++    assert cli._slash_handler("detour") is None
++    from cli import _get_plugin_cmd_handler_names
++    assert {"detour", "detour-end"} <= _get_plugin_cmd_handler_names()
 +
 +    command = resolve_text_command_alias("llm-cr", cli.config)
 +    assert command == "/detour child-model --provider child-provider"
@@ -3073,12 +2304,12 @@ index 0000000000..9f5fc9000a
 +def test_detour_end_restores_the_parents_own_history_and_route(db):
 +    parent = _new_session_id("par005")
 +    cli = _make_cli(db, parent, texts=("hello parent", "parent reply"))
-+    cli._handle_detour_command("/detour child-model --provider child-provider")
++    detour_cli(cli)._handle_detour_command("/detour child-model --provider child-provider")
 +    child = cli.session_id
 +    db.append_message(child, role="user", content="child only")
 +    cli.conversation_history = [{"role": "user", "content": "child only"}]
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    assert cli.session_id == parent
 +    # The actual transcript came back, loaded from the parent's own rows.
@@ -3097,9 +2328,9 @@ index 0000000000..9f5fc9000a
 +def test_detour_end_prefers_an_explicit_route_over_the_recorded_one(db):
 +    parent = _new_session_id("par006")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
-+    cli._handle_detour_end_command("/detour-end back-model --provider back-provider")
++    detour_cli(cli)._handle_detour_end_command("/detour-end back-model --provider back-provider")
 +
 +    assert cli.session_id == parent
 +    assert _texts(cli) == ["hello parent"]
@@ -3109,12 +2340,12 @@ index 0000000000..9f5fc9000a
 +def test_neither_transcript_ever_crosses_the_boundary(db):
 +    parent = _new_session_id("par007")
 +    cli = _make_cli(db, parent, texts=("parent secret",))
-+    cli._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_command("/detour")
 +    child = cli.session_id
 +    db.append_message(child, role="user", content="child secret")
 +    cli.conversation_history = [{"role": "user", "content": "child secret"}]
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    assert _db_texts(db, parent) == ["parent secret"]
 +    assert _db_texts(db, child) == ["child secret"]
@@ -3124,11 +2355,11 @@ index 0000000000..9f5fc9000a
 +def test_a_second_detour_end_is_a_quiet_no_op(db, capsys):
 +    parent = _new_session_id("par008")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour")
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +    capsys.readouterr()
 +
-+    cli._handle_detour_end_command("/detour-end back-model")
++    detour_cli(cli)._handle_detour_end_command("/detour-end back-model")
 +
 +    assert "Nothing to end" in capsys.readouterr().out
 +    assert cli.session_id == parent
@@ -3141,7 +2372,7 @@ index 0000000000..9f5fc9000a
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +    before = _session_ids(_isolated_home)
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    assert "Nothing to end" in capsys.readouterr().out
 +    assert cli.session_id == parent
@@ -3155,12 +2386,12 @@ index 0000000000..9f5fc9000a
 +    the current session belongs to — not at the lane a new detour would create, which is empty."""
 +    parent = _new_session_id("par010")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +    child, before = cli.session_id, record_path(_scope(parent)).read_bytes()
 +    sessions_before = _session_ids(_isolated_home)
 +    capsys.readouterr()
 +
-+    cli._handle_detour_command("/detour other-model")
++    detour_cli(cli)._handle_detour_command("/detour other-model")
 +
 +    assert "already open" in capsys.readouterr().out
 +    assert cli.session_id == child  # no second rotation
@@ -3170,7 +2401,7 @@ index 0000000000..9f5fc9000a
 +    assert "/model other-model --session" not in cli.applied_routes
 +
 +    # The one detour that IS open is still returnable.
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +    assert cli.session_id == parent
 +    assert _texts(cli) == ["hello parent"]
 +
@@ -3182,7 +2413,7 @@ index 0000000000..9f5fc9000a
 +    cli = _make_cli(db, parent)  # no transcript at all
 +    assert db.get_session(parent) is not None
 +
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    child = cli.session_id
 +    assert child != parent
@@ -3190,7 +2421,7 @@ index 0000000000..9f5fc9000a
 +    assert db.get_session(parent) is not None
 +    assert read_record(_scope(parent)).parent_session_id == parent
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    assert cli.session_id == parent
 +    assert cli.conversation_history == []
@@ -3203,8 +2434,8 @@ index 0000000000..9f5fc9000a
 +    first = _make_cli(db, first_parent, texts=("first parent",))
 +    second = _make_cli(db, second_parent, texts=("second parent",))
 +
-+    first._handle_detour_command("/detour first-child-model")
-+    second._handle_detour_command("/detour second-child-model")
++    detour_cli(first)._handle_detour_command("/detour first-child-model")
++    detour_cli(second)._handle_detour_command("/detour second-child-model")
 +    first_child, second_child = first.session_id, second.session_id
 +
 +    # Two lanes, two records, neither visible to the other.
@@ -3214,26 +2445,26 @@ index 0000000000..9f5fc9000a
 +    assert first_child != second_child
 +
 +    # Ending the second one must not touch the first.
-+    second._handle_detour_end_command("/detour-end")
++    detour_cli(second)._handle_detour_end_command("/detour-end")
 +    assert second.session_id == second_parent
 +    assert _texts(second) == ["second parent"]
 +    assert first.session_id == first_child
 +    assert read_record(_scope(first_parent)).status == STATUS_ACTIVE
 +
-+    first._handle_detour_end_command("/detour-end")
++    detour_cli(first)._handle_detour_end_command("/detour-end")
 +    assert first.session_id == first_parent
 +    assert _texts(first) == ["first parent"]
 +
 +
 +def test_a_gateway_record_is_not_usable_from_the_cli_lane(db, capsys):
-+    from hermes_cli.session_detour import begin_detour
++    from tests.fakes.session_detours_plugin import begin_detour
 +
 +    parent = _new_session_id("par012")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +    begin_detour(DetourScope(surface="gateway", channel="telegram:c1", owner="u1", lane="k1"),
 +                 parent_session_id=parent)
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    assert "Nothing to end" in capsys.readouterr().out
 +    assert cli.session_id == parent
@@ -3244,16 +2475,16 @@ index 0000000000..9f5fc9000a
 +    """A second CLI process has no in-memory handle; the child→lane index is what finds the record."""
 +    parent = _new_session_id("par013")
 +    cli = _make_cli(db, parent, texts=("hello parent", "parent reply"))
-+    cli._handle_detour_command("/detour child-model --provider child-provider")
++    detour_cli(cli)._handle_detour_command("/detour child-model --provider child-provider")
 +    child = cli.session_id
 +
 +    # "Restart": a brand-new CLI object on a brand-new session, nothing inherited from memory.
 +    fresh = _make_cli(db, _new_session_id("par014"))
-+    assert fresh._detour_open_scope is None
++    assert detour_cli(fresh)._detour_open_scope is None
 +    fresh._handle_resume_command(f"/resume {child}")
 +    assert fresh.session_id == child
 +
-+    fresh._handle_detour_end_command("/detour-end")
++    detour_cli(fresh)._handle_detour_end_command("/detour-end")
 +
 +    assert fresh.session_id == parent
 +    assert _texts(fresh) == ["hello parent", "parent reply"]
@@ -3270,7 +2501,7 @@ index 0000000000..9f5fc9000a
 +        raise RuntimeError("provider unreachable")
 +
 +    cli._handle_model_switch = _boom
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    out = capsys.readouterr().out
 +    assert "Detour not started" in out and "model switch" in out
@@ -3285,7 +2516,7 @@ index 0000000000..9f5fc9000a
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +    cli.model_switch_is_broken = True
 +
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    assert "Detour not started" in capsys.readouterr().out
 +    assert cli.session_id == parent
@@ -3301,7 +2532,7 @@ index 0000000000..9f5fc9000a
 +        raise RuntimeError("reset exploded")
 +
 +    monkeypatch.setattr(cli, "new_session", _boom)
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    assert "Detour not started" in capsys.readouterr().out
 +    assert cli.session_id == parent
@@ -3312,12 +2543,12 @@ index 0000000000..9f5fc9000a
 +def test_a_failed_resume_keeps_the_detour_open(db, capsys, monkeypatch):
 +    parent = _new_session_id("par018")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_command("/detour")
 +    child = cli.session_id
 +    capsys.readouterr()
 +
 +    monkeypatch.setattr(cli, "_handle_resume_command", lambda _cmd: None)  # refuses, quietly
-+    cli._handle_detour_end_command("/detour-end back-model")
++    detour_cli(cli)._handle_detour_end_command("/detour-end back-model")
 +
 +    assert "Could not return" in capsys.readouterr().out
 +    assert cli.session_id == child
@@ -3328,12 +2559,12 @@ index 0000000000..9f5fc9000a
 +def test_a_deleted_parent_session_refuses_the_return_and_keeps_the_record(db, capsys, _isolated_home):
 +    parent = _new_session_id("par019")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_command("/detour")
 +    child = cli.session_id
 +    db.delete_session(parent, sessions_dir=_isolated_home / "sessions")
 +    capsys.readouterr()
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    out = capsys.readouterr().out
 +    assert "no longer exists" in out
@@ -3345,13 +2576,13 @@ index 0000000000..9f5fc9000a
 +def test_an_unusable_record_refuses_the_return_and_is_preserved(db, capsys, payload):
 +    parent = _new_session_id("par020")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_command("/detour")
 +    child = cli.session_id
 +    path = record_path(_scope(parent))
 +    path.write_bytes(payload)
 +    capsys.readouterr()
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    assert "Could not end the detour" in capsys.readouterr().out
 +    assert cli.session_id == child  # fail closed: no switch, no new session
@@ -3362,13 +2593,13 @@ index 0000000000..9f5fc9000a
 +    parent = _new_session_id("par021")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +
-+    import hermes_cli.session_detour as detour_mod
++    from tests.fakes.session_detours_plugin import records as detour_mod
 +
 +    def _boom(*_a, **_kw):
 +        raise OSError("read-only filesystem")
 +
 +    monkeypatch.setattr(detour_mod, "write_record", _boom)
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    assert "could not be written" in capsys.readouterr().out
 +    assert cli.session_id == parent  # never rotated
@@ -3382,7 +2613,7 @@ index 0000000000..9f5fc9000a
 +    Returns the switch, so a test can let the platform cooperate again without ``monkeypatch.undo``
 +    (which would also undo the autouse home fixture's patches).
 +    """
-+    import hermes_cli.session_detour as detour_mod
++    from tests.fakes.session_detours_plugin import records as detour_mod
 +
 +    broken = {"on": True}
 +    real_flock = detour_mod._flock
@@ -3405,7 +2636,7 @@ index 0000000000..9f5fc9000a
 +    rows_before = _session_ids(_isolated_home)
 +    _break_the_lane_lock(monkeypatch)
 +
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    out = capsys.readouterr().out
 +    assert "Detour not started" in out and "could not be locked" in out
@@ -3422,12 +2653,12 @@ index 0000000000..9f5fc9000a
 +    """The open detour is left exactly as it was, so the return stays retryable."""
 +    parent = _new_session_id("par024")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
-+    cli._handle_detour_command("/detour")
++    detour_cli(cli)._handle_detour_command("/detour")
 +    child = cli.session_id
 +    capsys.readouterr()
 +    _break_the_lane_lock(monkeypatch)
 +
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +
 +    out = capsys.readouterr().out
 +    assert "Could not end the detour" in out and "could not be locked" in out
@@ -3440,12 +2671,12 @@ index 0000000000..9f5fc9000a
 +    parent = _new_session_id("par025")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +    broken = _break_the_lane_lock(monkeypatch)
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +    assert cli.session_id == parent
 +    capsys.readouterr()
 +
 +    broken["on"] = False  # the platform cooperates again
-+    cli._handle_detour_command("/detour child-model")
++    detour_cli(cli)._handle_detour_command("/detour child-model")
 +
 +    child = cli.session_id
 +    assert child and child != parent
@@ -3455,7 +2686,7 @@ index 0000000000..9f5fc9000a
 +
 +    # ...and so does the return leg that was refused a moment earlier.
 +    capsys.readouterr()
-+    cli._handle_detour_end_command("/detour-end")
++    detour_cli(cli)._handle_detour_end_command("/detour-end")
 +    assert cli.session_id == parent
 +    assert read_record(_scope(parent)).status == STATUS_RETURNED
 +
@@ -3465,19 +2696,320 @@ index 0000000000..9f5fc9000a
 +    parent = _new_session_id("par022")
 +    cli = _make_cli(db, parent, texts=("hello parent",))
 +
-+    cli._handle_detour_command(f"/detour {args}")
++    detour_cli(cli)._handle_detour_command(f"/detour {args}")
 +
 +    assert capsys.readouterr().out.strip().startswith("✗")
 +    assert cli.session_id == parent
 +    assert not record_path(_scope(parent)).exists()
 +    assert cli.applied_routes == []
++
++
++# ------------------------------------------------------------------- the feature switched off
++def test_a_disabled_plugin_leaves_no_detour_command_on_the_cli(db, capsys, disabled_plugin):
++    """Plugin on disk but not consented: ``/detour`` is simply not a command this CLI has."""
++    from cli import _get_plugin_cmd_handler_names
++
++    parent = _new_session_id("par023")
++    cli = _make_cli(db, parent, texts=("hello parent",))
++    before = _session_ids(_isolated_home_path(cli))
++
++    assert "detour" not in _get_plugin_cmd_handler_names()
++    assert cli._slash_handler("detour") is None
++
++    # Consumed by the CLI (True), never handed to the agent as a prompt.
++    assert cli.process_command("/detour child-model") is True
++
++    out = capsys.readouterr().out
++    assert "Unknown command: /detour" in out
++    assert cli.session_id == parent
++    assert _session_ids(_isolated_home_path(cli)) == before
++    assert not record_path(_scope(parent)).exists()
++    assert cli.applied_routes == []
++
++
++def test_a_bare_alias_for_a_disabled_detour_fails_loudly_instead_of_becoming_a_prompt(
++    db, capsys, disabled_plugin,
++):
++    """``llm-cr`` still rewrites to ``/detour``; with the feature off the user must SEE that.
++
++    The failure mode this guards against is the quiet one: the rewritten slash command falls
++    through as ordinary text and the model answers as if a detour had happened.
++    """
++    from hermes_cli.text_command_aliases import resolve_text_command_alias
++
++    parent = _new_session_id("par024")
++    cli = _make_cli(db, parent, texts=("hello parent",))
++    cli.config = {"text_command_aliases": {
++        "enabled": True,
++        "aliases": {"llm-cr": "/detour child-model --provider child-provider"}}}
++
++    command = resolve_text_command_alias("llm-cr", cli.config)
++    assert command == "/detour child-model --provider child-provider"
++
++    # True == "the CLI handled this input"; it is never forwarded to the agent.
++    assert cli.process_command(command) is True
++    assert "Unknown command: /detour" in capsys.readouterr().out
++    assert cli.session_id == parent
++
++
++def test_the_native_session_commands_are_still_the_clis_own(installed_plugin):
++    """The plugin composes ``/new`` and ``/resume``; it must not have replaced or wrapped either."""
++    import cli as cli_mod
++    from hermes_cli.cli_commands_mixin import CLICommandsMixin
++    from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
++    from hermes_cli.cli_session_mixin import CLISessionMixin
++    from hermes_cli.commands import resolve_command
++
++    # Each of the three natives the detour composes still resolves to its own core mixin — not to
++    # a plugin module, and not to anything wrapped around one.
++    for name, owner in (("new_session", CLISessionMixin),
++                        ("_handle_resume_command", CLICommandsMixin),
++                        ("_handle_model_switch", CLIModelSwitchMixin)):
++        assert getattr(cli_mod.HermesCLI, name) is getattr(owner, name), name
++    # No detour mixin is in the CLI's MRO any more.
++    assert not any("Detour" in klass.__name__ for klass in cli_mod.HermesCLI.__mro__)
++    # /new and /resume are still registry built-ins; /detour and /detour-end are not.
++    assert resolve_command("new") is not None and resolve_command("resume") is not None
++    assert resolve_command("detour") is None and resolve_command("detour-end") is None
++
++
++def test_a_context_taking_handler_with_no_host_refuses_instead_of_guessing(_isolated_home):
++    """A surface that cannot supply a session host must get a refusal, not a rotated session."""
++    from tests.fakes.session_detours_plugin import dispatch_detour, dispatch_detour_end
++
++    for dispatch, name in ((dispatch_detour, "detour"), (dispatch_detour_end, "detour-end")):
++        for context in (None, {}, {"surface": "tui"}, {"surface": "cli", "host": None}):
++            reply = dispatch("child-model", context=context)
++            assert isinstance(reply, str) and reply.startswith("❌"), (name, context)
++            assert f"/{name}" in reply
++    # A gateway context with no event is equally refused: there is no lane to act on.
++    assert dispatch_detour("", context={"surface": "gateway", "host": object()}).startswith("❌")
++
++
++def test_the_per_host_adapter_cache_does_not_retain_disposable_clis(db):
++    """Each CLI gets its own adapter, and a finished CLI is not pinned by the plugin."""
++    import gc
++    import weakref
++
++    from tests.fakes.session_detours_plugin import plugin as sdp
++
++    first = _make_cli(db, _new_session_id("par025"))
++    second = _make_cli(db, _new_session_id("par026"))
++
++    # Same host → the same adapter, which is what carries the open scope between the two legs.
++    assert sdp._cli_adapter(first) is sdp._cli_adapter(first)
++    assert sdp._cli_adapter(first) is not sdp._cli_adapter(second)
++
++    gone = weakref.ref(second)
++    assert sdp._cli_adapter(second) is not None
++    del second
++    gc.collect()
++    assert gone() is None, "the adapter cache is still holding the finished CLI"
++
++
++def _isolated_home_path(_cli):
++    """The temp home this test's CLI is running under."""
++    return Path(os.environ["HERMES_HOME"])
+diff --git a/tests/hermes_cli/test_plugin_command_context.py b/tests/hermes_cli/test_plugin_command_context.py
+new file mode 100644
+index 0000000000..45caa41df7
+--- /dev/null
++++ b/tests/hermes_cli/test_plugin_command_context.py
+@@ -0,0 +1,187 @@
++"""The generic core seam a plugin slash command needs to compose native session behavior.
++
++Two additive pieces of ``hermes_cli.plugins`` are under test, both feature-agnostic:
++
++* :func:`bind_plugin_command_context` — a handler that declares a ``context`` parameter receives
++  the dispatching surface's host; every handler that does not is called exactly as before.
++* ``register_command(busy_policy=...)`` / :func:`get_plugin_command_busy_policy` — how a plugin
++  declares that its command must not run while the session's agent is running.
++
++Backwards compatibility is the point of most of this file: the pre-existing one-argument plugin
++command contract (``fn(raw_args) -> str | None``) must be untouched, because every plugin written
++before the seam existed uses it.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli.plugins import (
++    VALID_PLUGIN_COMMAND_BUSY_POLICIES,
++    bind_plugin_command_context,
++    get_plugin_command_busy_policy,
++    get_plugin_command_handler,
++)
++
++CONTEXT = {"surface": "cli", "command": "demo", "host": object(), "session_key": "s1"}
++
++
++# --------------------------------------------------------------- context binding (compatibility)
++def test_an_old_one_argument_handler_is_returned_untouched():
++    """The historical contract: no ``context`` parameter means no behavior change at all."""
++    calls = []
++
++    def old_handler(raw_args: str):
++        calls.append(raw_args)
++        return f"ran:{raw_args}"
++
++    bound = bind_plugin_command_context(old_handler, CONTEXT)
++
++    # Not merely equivalent — the SAME object, so nothing about the call can have changed.
++    assert bound is old_handler
++    assert bound("a b") == "ran:a b"
++    assert calls == ["a b"]
++
++
++def test_a_handler_that_declares_context_receives_it_as_a_keyword():
++    seen = {}
++
++    def new_handler(raw_args: str = "", *, context=None):
++        seen["raw_args"], seen["context"] = raw_args, context
++        return "ok"
++
++    assert bind_plugin_command_context(new_handler, CONTEXT)("x --y") == "ok"
++    assert seen == {"raw_args": "x --y", "context": CONTEXT}
++
++
++def test_a_handler_with_no_arguments_at_all_still_works():
++    """``register_command`` has always accepted a zero-arg handler; binding must not break it."""
++    def bare_handler():
++        return "bare"
++
++    bound = bind_plugin_command_context(bare_handler, CONTEXT)
++    assert bound is bare_handler
++    assert bound() == "bare"
++
++
++def test_a_handler_taking_kwargs_but_not_context_is_not_given_one():
++    """``**kwargs`` is not a declaration of interest: only a named ``context`` parameter is."""
++    seen = {}
++
++    def kwargs_handler(raw_args: str = "", **kwargs):
++        seen.update(kwargs)
++        return "ok"
++
++    bound = bind_plugin_command_context(kwargs_handler, CONTEXT)
++    assert bound is kwargs_handler
++    assert bound("x") == "ok"
++    assert seen == {}
++
++
++def test_a_handler_whose_signature_cannot_be_read_is_returned_untouched():
++    """C callables have no introspectable signature; they must not be treated as context-takers."""
++    assert bind_plugin_command_context(len, CONTEXT) is len
++    assert bind_plugin_command_context(str.strip, CONTEXT) is str.strip
++
++
++@pytest.mark.asyncio
++async def test_an_async_context_handler_keeps_returning_its_coroutine():
++    """The gateway awaits what the handler returns; binding must stay transparent to that."""
++    async def async_handler(raw_args: str = "", *, context=None):
++        return f"{context['surface']}:{raw_args}"
++
++    result = bind_plugin_command_context(async_handler, CONTEXT)("z")
++    assert await result == "cli:z"
++
++
++def test_a_bound_handler_is_callable_with_no_arguments():
++    """Surfaces that dispatch a parameterless command call ``handler()``; the default must hold."""
++    def new_handler(raw_args: str = "", *, context=None):
++        return f"[{raw_args}]{context['command']}"
++
++    assert bind_plugin_command_context(new_handler, CONTEXT)() == "[]demo"
++
++
++# ------------------------------------------------------------------------------- the busy policy
++def test_only_reject_is_an_accepted_plugin_busy_policy():
++    """A plugin command has no mid-run handler table, so "dispatch" could not mean anything."""
++    assert VALID_PLUGIN_COMMAND_BUSY_POLICIES == {"reject"}
++
++
++@pytest.mark.parametrize("declared,expected", [
++    ("reject", "reject"),
++    (None, None),
++    ("dispatch", None),              # not meaningful for a plugin command → not recorded
++    ("interrupt_then_dispatch", None),
++    ("", None),
++    ("REJECT", None),                # exact token only; no silent case-folding
++])
++def test_the_declared_busy_policy_is_recorded_only_when_it_is_valid(
++    tmp_path, monkeypatch, declared, expected,
++):
++    """Registration goes through a real discovery pass over a real plugin on disk."""
++    _install_demo_plugin(tmp_path, monkeypatch, busy_policy=declared)
++
++    assert get_plugin_command_handler("demo-cmd") is not None
++    assert get_plugin_command_busy_policy("demo-cmd") == expected
++
++
++def test_an_unknown_command_declares_no_busy_policy(tmp_path, monkeypatch):
++    _install_demo_plugin(tmp_path, monkeypatch, busy_policy="reject")
++
++    assert get_plugin_command_busy_policy("no-such-command") is None
++
++
++def test_the_session_detours_plugin_declares_reject_for_both_legs(tmp_path, monkeypatch):
++    """The feature's own declaration, read back through the public core accessor."""
++    from tests.fakes import session_detours_plugin as sdp
++
++    home = tmp_path / ".hermes"
++    (home / "sessions").mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    sdp.install_into_home(home)
++    try:
++        assert get_plugin_command_busy_policy("detour") == "reject"
++        assert get_plugin_command_busy_policy("detour-end") == "reject"
++    finally:
++        sdp.reset_discovery()
++
++
++# ------------------------------------------------------------------------------------- the glue
++PLUGIN_SOURCE = '''
++def _handler(raw_args="", *, context=None):
++    return "demo:" + raw_args + ":" + str((context or {}).get("surface"))
++
++
++def register(ctx):
++    ctx.register_command("demo-cmd", _handler, description="demo"@BUSY@)
++'''
++
++
++def _install_demo_plugin(tmp_path, monkeypatch, *, busy_policy):
++    """A real plugin on disk, consented in config.yaml, discovered by the real PluginManager."""
++    from hermes_cli import plugins as plugins_mod
++
++    home = tmp_path / ".hermes"
++    plugin_dir = home / "plugins" / "demo-plugin"
++    plugin_dir.mkdir(parents=True)
++    (plugin_dir / "plugin.yaml").write_text(
++        'name: demo-plugin\nversion: "1.0.0"\ndescription: "demo"\n', encoding="utf-8")
++    busy_kwarg = "" if busy_policy is None else f", busy_policy={busy_policy!r}"
++    (plugin_dir / "__init__.py").write_text(
++        PLUGIN_SOURCE.replace("@BUSY@", busy_kwarg), encoding="utf-8")
++    (home / "config.yaml").write_text(
++        "plugins:\n  enabled:\n    - demo-plugin\n  disabled: []\n", encoding="utf-8")
++
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    plugins_mod._reset_plugin_managers_for_tests()
++    return plugins_mod._ensure_plugins_discovered(force=True)
++
++
++@pytest.fixture(autouse=True)
++def _unpin_discovered_plugins():
++    """Plugin discovery is process-global; never let one test's temp home leak into the next."""
++    yield
++    from hermes_cli import plugins as plugins_mod
++
++    plugins_mod._reset_plugin_managers_for_tests()
 diff --git a/tests/hermes_cli/test_session_detour_records.py b/tests/hermes_cli/test_session_detour_records.py
 new file mode 100644
-index 0000000000..8ff9ddac9f
+index 0000000000..146a743359
 --- /dev/null
 +++ b/tests/hermes_cli/test_session_detour_records.py
-@@ -0,0 +1,438 @@
-+"""Return-record contracts for ``/detour`` / ``/detour-end`` (hermes_cli/session_detour.py).
+@@ -0,0 +1,516 @@
++"""Return-record contracts for ``/detour`` / ``/detour-end`` (the ``session-detours`` plugin's ``detour_records``).
 +
 +These exercise the real store against a temp home: no surface, no sessions, just the durable
 +state that makes the return leg possible and the gates that stop it from being abused.
@@ -3489,7 +3021,7 @@ index 0000000000..8ff9ddac9f
 +
 +import pytest
 +
-+from hermes_cli.session_detour import (
++from tests.fakes.session_detours_plugin import (
 +    LOCK_REFUSAL,
 +    RECORD_VERSION,
 +    STATUS_ACTIVE,
@@ -3557,14 +3089,14 @@ index 0000000000..8ff9ddac9f
 +    scope = _scope()
 +    _enter(
 +        scope,
-+        parent_route={"model": "exit-model-900k", "provider": "exit-direct",
++        parent_route={"model": "gpt-6-astra-900k", "provider": "openai-codex",
 +                      "api_key": "sk-must-not-persist", "messages": [{"role": "user", "content": "secret"}]},
 +    )
 +    text = record_path(scope).read_text(encoding="utf-8")
 +    assert "sk-must-not-persist" not in text and "secret" not in text
 +    stored = json.loads(text)["parent_route"]
 +    assert set(stored) == {"model", "provider"}
-+    assert stored["model"] == "exit-model-900k"
++    assert stored["model"] == "gpt-6-astra-900k"
 +
 +
 +def test_filename_is_a_digest_so_scope_text_cannot_escape_the_directory(home):
@@ -3787,7 +3319,7 @@ index 0000000000..8ff9ddac9f
 +
 +def _unlockable(monkeypatch):
 +    """Make the advisory lock unobtainable, the way a platform without it would."""
-+    import hermes_cli.session_detour as sd
++    from tests.fakes.session_detours_plugin import records as sd
 +
 +    monkeypatch.setattr(sd, "_flock", lambda *a, **k: (_ for _ in ()).throw(OSError("unsupported")))
 +    return sd
@@ -3849,7 +3381,7 @@ index 0000000000..8ff9ddac9f
 +def test_a_refused_lock_leaves_the_lane_acquirable_again(home, monkeypatch):
 +    """The in-process mutex is released on the failure path, so a retry is a normal acquisition —
 +    a refused command must not wedge the lane."""
-+    import hermes_cli.session_detour as sd
++    from tests.fakes.session_detours_plugin import records as sd
 +
 +    calls = []
 +    real_flock = sd._flock
@@ -3915,6 +3447,84 @@ index 0000000000..8ff9ddac9f
 +    begin_detour(_scope(), parent_session_id="20260101_000000_aaa")
 +    assert detour_root(home).is_dir()
 +    assert os.path.isfile(record_path(_scope()))
++
++
++# ------------------------------------------------------- records written before the plugin move
++#: A record exactly as the pre-plugin core module (``hermes_cli/session_detour.py``) wrote it.
++#: Byte-for-byte: the move to ``contrib/.../session-detours/detour_records.py`` changed no line of
++#: that module, so a user upgrading mid-detour must find their way back, not an error.
++LEGACY_RECORD_JSON = """{
++  "version": 1,
++  "status": "active",
++  "profile": "default",
++  "scope": {
++    "surface": "gateway",
++    "channel": "discord:chan1",
++    "owner": "user1",
++    "lane": "key1"
++  },
++  "parent_session_id": "20260101_000000_aaa",
++  "child_session_id": "20260101_000100_bbb",
++  "parent_route": {
++    "model": "parent-model",
++    "provider": "parent-provider"
++  },
++  "child_route": {
++    "model": "child-model",
++    "provider": "child-provider"
++  },
++  "entered_at": "2026-01-01T00:01:00+00:00",
++  "returned_at": "",
++  "token": "legacytoken0001"
++}"""
++
++
++def _write_legacy_record(home, scope) -> None:
++    path = record_path(scope, home)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(LEGACY_RECORD_JSON, encoding="utf-8")
++
++
++def test_a_record_written_before_the_plugin_move_is_still_read(home):
++    scope = _scope()
++    _write_legacy_record(home, scope)
++
++    record = read_record(scope)
++
++    assert record is not None
++    assert record.version == RECORD_VERSION  # no schema churn across the move
++    assert (record.status, record.parent_session_id, record.child_session_id) == (
++        STATUS_ACTIVE, "20260101_000000_aaa", "20260101_000100_bbb")
++    assert record.parent_route == {"model": "parent-model", "provider": "parent-provider"}
++    assert record.token == "legacytoken0001"
++
++
++def test_an_in_flight_detour_from_before_the_move_still_resolves_its_return_target(home):
++    """The point of the compatibility: a user mid-detour at upgrade time can still come back."""
++    scope = _scope()
++    _write_legacy_record(home, scope)
++
++    record = read_record(scope)
++    target = resolve_return_target(
++        record, scope, current_session_id="20260101_000100_bbb",
++        session_exists=lambda sid: sid == "20260101_000000_aaa")
++
++    assert target == "20260101_000000_aaa"
++    assert record.parent_route == {"model": "parent-model", "provider": "parent-provider"}
++
++
++def test_closing_a_pre_move_detour_rewrites_it_in_place_without_schema_change(home):
++    scope = _scope()
++    _write_legacy_record(home, scope)
++
++    closed = mark_returned(read_record(scope), home)
++
++    assert closed.status == STATUS_RETURNED
++    stored = json.loads(record_path(scope, home).read_text(encoding="utf-8"))
++    assert stored["version"] == RECORD_VERSION
++    # Same key set as the record the old core wrote: nothing added, nothing dropped.
++    assert set(stored) == set(json.loads(LEGACY_RECORD_JSON))
++    assert stored["returned_at"] and stored["parent_session_id"] == "20260101_000000_aaa"
 diff --git a/tests/hermes_cli/test_text_command_aliases.py b/tests/hermes_cli/test_text_command_aliases.py
 new file mode 100644
 index 0000000000..136c75495e
@@ -3935,7 +3545,7 @@ index 0000000000..136c75495e
 +from hermes_cli.text_command_aliases import alias_table, resolve_text_command_alias
 +
 +SWITCH_IN = "/model hf.co/vendor/Some-Model-GGUF:Q4_K_M --provider local-direct --session"
-+SWITCH_OUT = "/model exit-model-900k --provider exit-direct --session"
++SWITCH_OUT = "/model gpt-6-astra-900k --provider openai-codex --session"
 +
 +CONFIG = {
 +    "text_command_aliases": {

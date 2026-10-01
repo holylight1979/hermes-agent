@@ -145,10 +145,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("set-home",), desktop="terminal"),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]", argument_mode="mixed"),
-    CommandDef("detour", "Leave for a fresh side session (this one is kept to return to)", "Session",
-               args_hint="[model] [--provider name]", argument_mode="mixed"),
-    CommandDef("detour-end", "Return to the session the detour left, restoring its history", "Session",
-               args_hint="[model] [--provider name]", argument_mode="mixed"),
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
 
     # Configuration

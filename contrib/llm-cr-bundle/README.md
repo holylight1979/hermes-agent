@@ -12,11 +12,22 @@
 
 三層，彼此獨立但互相配合：
 
+三層功能，全部由 **HOME 底下的三個 plugin** 提供；core patch 只留下它們需要的通用接縫：
+
 | 層 | 內容 | 安裝位置 |
 |---|---|---|
-| 精確文字別名 | 整句（去除首尾空白後）完全等於 `llm-cr` / `llm-cr-end` 時，在任何 LLM 看到訊息**之前**改寫成對應的 slash command | core patch（CLI 入口 + 共用 matcher）＋ Gateway 端 plugin |
-| 原生 session 繞道 | `/detour` 開一個全新的子 session（不帶入母 session 的歷史），`/detour-end` 回到母 session 並還原它自己的路由 | core patch（新模組 + 指令註冊） |
-| Prompt 注入 | 只有「這一個請求真的要送往設定的 provider + model + base URL + api_mode」時，才把本機指令檔附加到送出請求**副本**的第一條 system message | HOME 下的 `llm-cr-prompt` plugin |
+| 精確文字別名 | 整句（去除首尾空白後）完全等於 `llm-cr` / `llm-cr-end` 時，在任何 LLM 看到訊息**之前**改寫成對應的 slash command | `text-command-aliases` plugin（Gateway 端）＋ core patch（共用 matcher 與 CLI 入口） |
+| 原生 session 繞道 | `/detour` 開一個全新的子 session（不帶入母 session 的歷史），`/detour-end` 回到母 session 並還原它自己的路由 | **`session-detours` plugin**（回程記錄、CLI leg、Gateway leg 全在 plugin 內） |
+| Prompt 注入 | 只有「這一個請求真的要送往設定的 provider + model + base URL + api_mode」時，才把本機指令檔附加到送出請求**副本**的第一條 system message | `llm-cr-prompt` plugin（`llm_execution` middleware） |
+
+2.x 的核心決定是**「功能全在 plugin，core 只有通用接縫」**：`/detour` 不再是 core 的內建指令，
+而是 `session-detours` plugin 用 `ctx.register_command()` 註冊的 plugin command。沒有啟用這個
+plugin，`/detour` 就**完全不存在**（補完清單裡沒有、Gateway dispatch 不認、CLI 也不認），
+而所有原生指令 handler 一行都沒被改。
+
+core patch 為此加入的接縫都是**與 detour 無關、任何 plugin 都能用**的通用能力（見第 6 節）：
+plugin command 可以拿到呼叫端的 host context、可以宣告 `busy_policy="reject"`、execution
+middleware 可以 fail-closed 中止。
 
 幾個刻意的設計決定：
 
@@ -24,6 +35,10 @@
   都在之後照常執行。別名不會繞過任何一道關卡。
 * `/detour` 與 `/detour-end` 由**原生** handler 組成（Gateway 的 `_handle_reset_command` /
   `_handle_resume_command`，CLI 的 `new_session` / `_handle_resume_command`），不是另寫一套 session 輪替。
+  plugin 透過 host context 拿到活著的 `HermesCLI` / `GatewayRunner`，再用**每個 host 一個 adapter**
+  把原本的 mixin 綁上去 —— 不 monkey-patch 任何 host class，也不複製 transcript。
+* `/detour` 與 `/detour-end` 宣告 `busy_policy="reject"`：它們會輪替 session，所以跟會輪替的內建指令
+  （`/model`、`/resume`）一樣，在 agent 執行中直接拒絕，而不是打斷那一回合。
 * prompt 注入採「路由即身分」：沒有第二個 mode 旗標。唯一的判斷是「這個請求是否正要送往設定的那條路由」。
   因此手動用 `/model` 選到同一條路由，會得到同一個 persona —— 這是設計，不是漏洞。
 * 注入是 fail-closed：路由命中但指令檔遺失／空白／無法讀取／非 UTF-8，會在**任何網路呼叫之前**
@@ -79,6 +94,7 @@ python install.py rollback --receipt <backup-dir>/<run-id>/receipt.json \
 | `--enable-prompt-plugin` | 啟用 `llm_execution` prompt 注入（需要指令檔已存在） |
 | `--instruction-path` | 明確指定指令檔路徑（只檢查存在性） |
 | `--no-aliases` | 只裝 core + payload，不啟用文字別名 |
+| `--no-detour-plugin` | 裝進 `session-detours` payload 但**不啟用**它；`/detour` 與 `/detour-end` 於是在任何介面上都不存在（`verify` 會反向確認「沒有任何東西註冊這兩個指令」） |
 | `--backup-dir` | 備份目錄。預設 `<home>/../llm-cr-bundle-backups`，且**必須在 repo 與 home 之外** |
 
 退出碼：`0` 成功 / `1` 驗證失敗 / `2` 拒絕執行（fail-closed，未寫入任何東西）。
@@ -133,25 +149,51 @@ install.py        安裝程式（標準庫 + PyYAML）
 build.py          重新產生 manifest.json 與可重現的 ZIP
 manifest.json     基準 commit、所有 checksum、API 前置檢查表、測試清單
 core.patch        core 變更（git apply 相容，含 --reverse --check）
-payload/          要裝到 <hermes-home> 底下的 plugin 檔案
+payload/          要裝到 <hermes-home> 底下的三個 plugin
+                    plugins/text-command-aliases/   Gateway 端別名改寫
+                    plugins/session-detours/        /detour 與 /detour-end（含回程記錄與兩邊 surface）
+                    plugins/llm-cr-prompt/          路由限定的 prompt 注入
 tests/            安裝程式自己的測試
 docs/SKILL.md     去識別化的技能說明文件（僅供參考，不會被安裝）
 ```
 
-`core.patch` 是針對 manifest 裡的 `base_commit` 產生的，涵蓋 18 個路徑
-（10 個 core 檔案 + 8 個測試檔案），其中 10 個是新檔案。
+`core.patch` 是針對 manifest 裡的 `base_commit` 產生的，涵蓋 **17 個路徑：7 個 core 檔案 +
+10 個測試檔案**，其中 11 個是新檔案（1 個 core 新模組 + 10 個測試）。
+
+### core patch 實際改了哪些接縫
+
+這 7 個 core 檔案裡，與 llm-cr **無關**的通用能力共 4 項 —— 它們是「讓 plugin 有能力做這件事」，
+不是「把這件事寫進 core」：
+
+| 檔案 | 改動 | 為什麼是通用的 |
+|---|---|---|
+| `hermes_cli/plugins.py` | `bind_plugin_command_context()`：handler 若宣告 `context` 參數，就收到 `{surface, command, host, session_key, event, source}`；`register_command(..., busy_policy=...)` 與 `get_plugin_command_busy_policy()` | 任何需要組合原生 session 行為（開 session、resume、換路由）的 plugin command 都適用。沒宣告 `context` 的既有 handler 照舊呼叫，完全不受影響 |
+| `cli.py` | `_run_plugin_slash_command` 綁上 CLI 的 host context；`_tui_process_one_input` 前置呼叫別名 matcher | 同上；別名入口是 CLI 這一側的 matcher 掛載點 |
+| `gateway/run_inbound.py` | plugin command dispatch 綁上 Gateway 的 host context、**用正規化後的名稱**再過一次 slash 權限閘、busy 快路徑認得 `busy_policy="reject"` 的 plugin command | 正規化名稱的閘門修掉的是通用漏洞：`/detour_end` 這種底線拼法原本會繞過以輸入原文為準的冷路徑檢查 |
+| `gateway/run_busy.py` | 把內建的 busy 拒絕用語抽成 `_busy_reject_text()` | 讓 plugin command 的拒絕**一字不差**等於內建指令的拒絕，而不是另寫一句 |
+| `hermes_cli/middleware.py` | 新增 `MiddlewareAbort`，execution chain 遇到它直接往上拋 | execution middleware 原本 fail-open；對「工作就是改 payload」的 callback 來說，跳過它等於安靜送出另一個請求 |
+| `hermes_cli/text_command_aliases.py` | 新檔案：共用的整句比對器（大小寫敏感、只去首尾空白） | 讓每個 surface 用同一條規則 |
+| `hermes_cli/config.py` | 把 `text_command_aliases` 加進 `_OPEN_DICT_TOP_LEVEL_KEYS` | config 驗證才會接受這個區段 |
+
+**v1 → v2 搬走了什麼：** v1 把 detour 寫在 core（`hermes_cli/session_detour.py`、
+`hermes_cli/cli_detour_mixin.py`、`gateway/slash_commands_detour.py`，加上 `hermes_cli/commands.py`
+與 `gateway/slash_commands.py` 的指令註冊）。2.x 把這些整批移到 `payload/plugins/session-detours/`
+（`detour_records.py` / `cli_surface.py` / `gateway_surface.py`），core 的指令註冊表因此**一行都沒動**。
+`verify` 會主動檢查這件事：若目標的內建指令表裡還找得到 `/detour`，就是舊版殘留，直接判失敗。
 
 **關於依賴的實話：** 原始開發分支裡有不少與 llm-cr 無關的改動
 （session hygiene、process registry、Windows 暫存檔修正、Discord/LINE adapter、model library 路由等），
 **這些都沒有被包進來**。另外，`pre_gateway_dispatch` 的 rewrite directive、
-`register_middleware`、`atomic_json_write`、`parse_model_switch_args` 等等
+`register_middleware`、`register_command`、`atomic_json_write`、`parse_model_switch_args` 等等
 在基準 commit 上**本來就存在**，所以 Gateway 的 hook 路徑完全不需要 patch —— 只需要那個 plugin。
-`gateway/run.py`、`hermes_cli/plugins.py`、`hermes_cli/plugins_dispatch.py` 在原始分支雖有改動，
+`gateway/run.py`、`hermes_cli/plugins_dispatch.py` 在原始分支雖有改動，
 但那些 hunk 屬於上述無關的功能，因此**不在**本 bundle 內。
 
 ---
 
 ## 7. 測試
+
+在只有套用 patch、沒有整份 bundle 原始目錄的乾淨 checkout 上，先將已安裝的 `session-detours` 外掛複製到可拋棄 checkout 的 `contrib/llm-cr-bundle/payload/plugins/session-detours/`。測試執行器會隔離 HERMES_HOME，因此不能依赖正式 HOME 的外掛作為測試來源；此副本只供測試，驗證 rollback 前須刪除。實際執行環境仍從 HOME/plugins 載入外掛。
 
 安裝程式自己的測試（不需要目標 repo）：
 
@@ -164,15 +206,22 @@ scripts/run_tests.sh contrib/llm-cr-bundle/tests/test_bundle_installer.py
 ```bash
 scripts/run_tests.sh \
   tests/hermes_cli/test_text_command_aliases.py \
+  tests/hermes_cli/test_plugin_command_context.py \
   tests/hermes_cli/test_session_detour_records.py \
   tests/hermes_cli/test_cli_detour.py \
   tests/gateway/test_text_command_alias_dispatch.py \
   tests/gateway/test_text_command_alias_model_switch.py \
   tests/gateway/test_text_command_alias_deployed_plugin.py \
   tests/gateway/test_detour_commands.py \
-  tests/cli/test_slash_dispatch_table.py
+  tests/gateway/test_detour_plugin_dispatch.py
+```
 
-# prompt 注入測試請在可拋棄 worktree 內，複製整個 plugin 目錄到 tests/_bundle_prompt 後執行：
+detour 相關測試**不複製 plugin 實作**：`tests/fakes/session_detours_plugin.py` 會用 Hermes 自己的
+載入方式載入真正的 plugin 檔案。優先找本 checkout 的 `contrib/llm-cr-bundle/payload/plugins/session-detours/`；
+在只套了 patch、沒有 `contrib/` 的目標上，改用**已安裝**的 `<home>/plugins/session-detours/`。
+也就是說在那種目標上，要先 `apply` 再跑這些測試。
+
+```bash，複製整個 plugin 目錄到 tests/_bundle_prompt 後執行：
 scripts/run_tests.sh tests/_bundle_prompt/tests/test_llm_cr_prompt_injection.py
 # 完成後移除該測試副本，再做 rollback 驗證。
 ```

@@ -668,11 +668,20 @@ class PluginContext:
     @_serialized_replacement
     def register_command(
         self, name: str, handler: Callable, description: str = "", args_hint: str = "",
-        argument_mode: str | None = None,
+        argument_mode: str | None = None, busy_policy: str | None = None,
     ) -> Optional[PluginRegistration]:
         """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
         (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
-        field; without it the command registers parameterless there but still accepts trailing text."""
+        field; without it the command registers parameterless there but still accepts trailing text.
+
+        A handler that also declares a keyword ``context`` parameter
+        (``fn(raw_args, *, context=None)``) receives the dispatching surface's host context — see
+        :func:`bind_plugin_command_context`.
+
+        ``busy_policy="reject"`` declares the command unsafe to run while this session's agent is
+        running, so the gateway's busy fast-path refuses it instead of interrupting the turn
+        (the same treatment a built-in ``CommandDef(busy_policy="reject")`` gets). ``None`` keeps
+        the historical behavior: the busy path does not recognize the command."""
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
@@ -689,6 +698,7 @@ class PluginContext:
             "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
             "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
             else ("text" if hint else None),
+            "busy_policy": busy_policy if busy_policy in VALID_PLUGIN_COMMAND_BUSY_POLICIES else None,
         }
         return self._register_entry("command", clean, self._manager._plugin_commands, entry,
                                     "Plugin %s registered command: /%s", clean)
@@ -1997,6 +2007,56 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+#: Busy policies a plugin command may declare. Only "reject" is accepted: a plugin command has no
+#: mid-run handler table to dispatch into, so "dispatch"/"interrupt_then_dispatch" would have
+#: nothing to mean here.
+VALID_PLUGIN_COMMAND_BUSY_POLICIES: Set[str] = {"reject"}
+
+
+def get_plugin_command_busy_policy(name: str) -> Optional[str]:
+    """The ``busy_policy`` a plugin declared for ``/name``, or ``None`` when it declared none."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    return (entry or {}).get("busy_policy") or None
+
+
+def _handler_accepts_context(handler: Callable) -> bool:
+    """True when *handler* declares a ``context`` parameter (so the surface may pass one)."""
+    try:
+        params = inspect.signature(handler).parameters
+    except (TypeError, ValueError):  # builtins / C callables have no introspectable signature
+        return False
+    return "context" in params
+
+
+def bind_plugin_command_context(handler: Callable, context: Any) -> Callable:
+    """Return *handler* with the dispatching surface's host *context* bound, when it wants one.
+
+    A plugin slash command handler is historically called as ``handler(raw_args)`` and gets no
+    access to the live session host, so commands that have to compose native session behavior
+    (start a session, resume one, switch the route) could only be written inside core. A handler
+    that declares ``def handler(raw_args, *, context=None)`` now receives:
+
+    ``surface``      ``"cli"`` or ``"gateway"``.
+    ``command``      the canonical command name as dispatched.
+    ``host``         the live ``HermesCLI`` / ``GatewayRunner`` instance.
+    ``session_key``  the surface's own session identity, when it has one.
+    ``event``        gateway only: the ``MessageEvent`` being dispatched.
+    ``source``       gateway only: the ``SessionSource`` it resolved to.
+
+    Handlers that do not declare ``context`` are returned unchanged and keep being called exactly
+    as before, so every pre-existing plugin command is unaffected. Surfaces with no host context
+    (e.g. the TUI RPC bridge) simply never bind one, and a context-taking handler sees ``None`` —
+    which it is expected to refuse, not guess around.
+    """
+    if not _handler_accepts_context(handler):
+        return handler
+
+    def _bound(raw_args: str = ""):
+        return handler(raw_args, context=context)
+
+    return _bound
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

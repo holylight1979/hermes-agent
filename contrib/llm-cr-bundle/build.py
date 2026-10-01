@@ -27,7 +27,7 @@ from pathlib import Path
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 NAME = "llm-cr-bundle"
-VERSION = "1.0.0"
+VERSION = "2.0.0"  # 2.x is plugin-first: the detour feature moved out of core into a payload plugin
 BASE_COMMIT = "45a6101f36576367359c171cd5820ee76a3d047b"
 
 # Files the bundle itself consists of, in archive order. ``manifest.json`` is excluded on purpose:
@@ -38,13 +38,14 @@ BUNDLE_FILES = ["README.md", "install.py", "build.py", "core.patch", "docs/SKILL
 # suite inside the Hermes home.
 TESTS_IN_REPO = [
     "tests/hermes_cli/test_text_command_aliases.py",
+    "tests/hermes_cli/test_plugin_command_context.py",
     "tests/hermes_cli/test_session_detour_records.py",
     "tests/hermes_cli/test_cli_detour.py",
     "tests/gateway/test_text_command_alias_dispatch.py",
     "tests/gateway/test_text_command_alias_model_switch.py",
     "tests/gateway/test_text_command_alias_deployed_plugin.py",
     "tests/gateway/test_detour_commands.py",
-    "tests/cli/test_slash_dispatch_table.py",
+    "tests/gateway/test_detour_plugin_dispatch.py",
 ]
 TESTS_IN_HOME = ["plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py"]
 
@@ -52,15 +53,35 @@ REQUIRED_APIS = [
     {
         "file": "gateway/run_inbound.py",
         "contains": ["def _hm_pre_gateway_dispatch_hook", '_action == "rewrite"',
-                     "allow_gateway_control"],
+                     "allow_gateway_control", "_hm_dispatch_quick_and_plugin_commands",
+                     "get_plugin_command_handler"],
         "why": "the text-command-aliases plugin rewrites event.text through this existing hook "
-               "seam; without the rewrite directive the alias would silently never fire",
+               "seam; without the rewrite directive the alias would silently never fire. The last "
+               "two are the plugin-command dispatch sink the patch extends with a host context and "
+               "a normalized-name access gate",
     },
     {
         "file": "hermes_cli/plugins.py",
         "contains": ['"pre_gateway_dispatch"', "def register_middleware", "def register_hook",
-                     "def get_config"],
-        "why": "both plugins register through these loader APIs and read their own settings subtree",
+                     "def get_config", "def register_command", "_plugin_commands"],
+        "why": "the three plugins register through these loader APIs and read their own settings "
+               "subtree; session-detours registers slash commands, so the patch extends "
+               "register_command (busy_policy) and the command table the surfaces read",
+    },
+    {
+        "file": "cli.py",
+        "contains": ["def _run_plugin_slash_command", "resolve_plugin_command_result"],
+        "why": "the CLI leg of a plugin slash command is dispatched here; the patch binds the host "
+               "context onto this call, which is what lets session-detours compose native session "
+               "commands from outside core",
+    },
+    {
+        "file": "gateway/run_busy.py",
+        "contains": ["def _dispatch_busy_slash_command", "def _check_slash_access",
+                     "can't run "],
+        "why": "the patch factors the built-in busy refusal text out of this mixin so a plugin "
+               "command that declared busy_policy=\"reject\" is refused mid-turn in exactly the "
+               "same words, and reuses this access gate for it",
     },
     {
         "file": "hermes_cli/middleware.py",
@@ -85,12 +106,12 @@ REQUIRED_APIS = [
     {
         "file": "utils.py",
         "contains": ["def atomic_json_write"],
-        "why": "session_detour writes its durable return records through this",
+        "why": "the session-detours plugin writes its durable return records through this",
     },
     {
         "file": "hermes_cli/profiles.py",
         "contains": ["def get_active_profile_name"],
-        "why": "session_detour labels a record with its profile",
+        "why": "the session-detours plugin labels a record with its profile",
     },
     {
         "file": "hermes_constants.py",
@@ -100,7 +121,7 @@ REQUIRED_APIS = [
     {
         "file": "hermes_cli/model_switch.py",
         "contains": ["def parse_model_switch_args"],
-        "why": "the detour route parser reuses the one /model parser, including its flag conflicts",
+        "why": "the plugin's detour route parser reuses the one /model parser, including its flag conflicts",
     },
     {
         "file": "gateway/slash_commands_session.py",
@@ -115,8 +136,9 @@ REQUIRED_APIS = [
     },
     {
         "file": "gateway/run.py",
-        "contains": ["def _session_key_for_source"],
-        "why": "the gateway detour lane key is the native session key for the source",
+        "contains": ["def _session_key_for_source", "def _normalize_source_for_session_key"],
+        "why": "the gateway detour lane key is the native session key for the source, resolved "
+               "through the same source normalization the turn itself uses",
     },
     {
         "file": "hermes_cli/cli_session_mixin.py",
@@ -132,12 +154,6 @@ REQUIRED_APIS = [
         "file": "hermes_cli/cli_model_switch_mixin.py",
         "contains": ["def _handle_model_switch"],
         "why": "the CLI detour applies its route through the native model switch",
-    },
-    {
-        "file": "hermes_cli/commands.py",
-        "contains": ["COMMAND_REGISTRY", "CommandDef("],
-        "why": "the patch registers /detour and /detour-end in this central registry; the CLI "
-               "reaches them via the _handle_<name>_command naming-convention fallback",
     },
 ]
 

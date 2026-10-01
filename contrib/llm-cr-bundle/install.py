@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Reapplicable installer for the llm-cr bundle (exact text aliases + native session detour +
+"""Reapplicable installer for the llm-cr bundle (exact text aliases + the session-detours plugin +
 route-gated prompt injection).
+
+The feature itself lives in PLUGINS (``payload/plugins/``); ``core.patch`` only adds the generic
+seams those plugins need — a host context for plugin slash commands, a busy policy for them, the
+alias matcher and config key, and the fail-closed middleware abort.
 
 Standard library only, except PyYAML for the config merge — the one non-stdlib dependency, probed
 explicitly in :func:`_require_yaml` with an actionable message instead of an ImportError traceback.
@@ -55,6 +59,14 @@ PAYLOAD_DIR = BUNDLE_DIR / "payload"
 ALIAS_SECTION = "text_command_aliases"
 PROMPT_PLUGIN = "llm-cr-prompt"
 ALIAS_PLUGIN = "text-command-aliases"
+#: Owns /detour and /detour-end. Enabled by default because the aliases this bundle configures
+#: resolve to exactly those commands: leaving it off would wire a text alias to a command nothing
+#: handles. ``--no-detour-plugin`` is the deliberate opt-out.
+DETOUR_PLUGIN = "session-detours"
+#: The slash commands the detour plugin must register once it is enabled, with the busy policy it
+#: must declare for each. Read off the live plugin manager in ``verify`` — never assumed, and never
+#: looked for in the built-in command registry, which (by design) no longer knows these names.
+DETOUR_COMMANDS = {"detour": "reject", "detour-end": "reject"}
 DEFAULT_API_MODE = "chat_completions"
 INSTRUCTION_RELPATH = Path("skills") / "productivity" / "llm-crack-talk" / "llm-cr-instruction.md"
 
@@ -378,6 +390,8 @@ def plan_config_merge(config: Dict[str, Any], opts: "Options", cr_base_url: str,
     enabled = plugins.get("enabled")
     enabled = list(enabled) if isinstance(enabled, list) else []
     wanted = ([ALIAS_PLUGIN] if opts.enable_aliases else []) + (
+        [DETOUR_PLUGIN] if opts.enable_detours else []
+    ) + (
         [PROMPT_PLUGIN] if opts.enable_prompt_plugin else []
     )
     for name in wanted:
@@ -439,6 +453,7 @@ class Options:
         )
         self.enable_prompt_plugin = bool(args.enable_prompt_plugin)
         self.enable_aliases = not bool(args.no_aliases)
+        self.enable_detours = not bool(getattr(args, "no_detour_plugin", False))
         self.backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else (
             self.home.parent / "llm-cr-bundle-backups"
         )
@@ -687,6 +702,13 @@ def cmd_check(opts: Options, manifest: Dict[str, Any], *, quiet: bool = False) -
     lines.append(f"config merge   : {len(changes)} change(s) to {opts.config_path}")
     for text in changes:
         lines.append(f"  + {text}")
+    if opts.enable_detours:
+        lines.append(f"detour plugin  : {DETOUR_PLUGIN} enabled; it registers "
+                     + ", ".join(f"/{name}" for name in sorted(DETOUR_COMMANDS))
+                     + " (core registers neither)")
+    else:
+        lines.append(f"detour plugin  : {DETOUR_PLUGIN} installed but NOT enabled "
+                     "(--no-detour-plugin): /detour and /detour-end will not exist")
     if opts.enable_prompt_plugin:
         lines.append(f"prompt plugin  : enabled; instruction file present at "
                      f"{opts.instruction_file} (existence only — never read)")
@@ -947,8 +969,12 @@ def cmd_verify(opts: Options, manifest: Dict[str, Any]) -> int:
             loaded = getattr(manager, "_plugins", {}) or {}
             hooks = getattr(manager, "_hooks", {}) or {}
             middleware = getattr(manager, "_middleware", {}) or {}
+            commands = getattr(manager, "_plugin_commands", {}) or {}
             wanted = (
                 [(ALIAS_PLUGIN, "hook", "pre_gateway_dispatch")] if opts.enable_aliases else []
+            ) + (
+                [(DETOUR_PLUGIN, "command", tuple(sorted(DETOUR_COMMANDS)))]
+                if opts.enable_detours else []
             ) + (
                 [(PROMPT_PLUGIN, "middleware", "llm_execution")] if opts.enable_prompt_plugin else []
             )
@@ -962,12 +988,62 @@ def cmd_verify(opts: Options, manifest: Dict[str, Any]) -> int:
                     failures.append(f"plugin {name} was discovered but is not enabled")
                 if getattr(entry, "error", None):
                     failures.append(f"plugin {name} loaded with an error: {entry.error}")
+                if kind == "command":
+                    # The feature IS these registrations: read them off the live manager rather
+                    # than trusting that the payload is on disk.
+                    for command in seam:
+                        registration = commands.get(command)
+                        if not isinstance(registration, dict) or not registration.get("handler"):
+                            failures.append(f"plugin {name} did not register /{command}")
+                            continue
+                        policy, expected = registration.get("busy_policy"), DETOUR_COMMANDS[command]
+                        if policy != expected:
+                            failures.append(
+                                f"/{command} registered with busy_policy {policy!r}, expected "
+                                f"{expected!r} (it rotates the session, so it must refuse mid-turn)"
+                            )
+                        else:
+                            checks.append(f"plugin loaded + enabled by production discovery with "
+                                          f"command /{command} (busy_policy={policy!r}): {name}")
+                    continue
                 registered = hooks if kind == "hook" else middleware
                 if registered.get(seam):
                     checks.append(f"plugin loaded + enabled by production discovery with "
                                   f"{kind} {seam!r}: {name}")
                 else:
                     failures.append(f"plugin {name} did not register {kind} {seam!r}")
+
+            # Disabled means gone, not merely inert: with the plugin unconsented nothing may claim
+            # /detour on any surface. (This is the whole point of the plugin-first layout.)
+            if not opts.enable_detours:
+                stray = sorted(name for name in DETOUR_COMMANDS if name in commands)
+                if stray:
+                    failures.append("detour plugin is not enabled, yet these commands are "
+                                    "registered: " + ", ".join(f"/{n}" for n in stray))
+                else:
+                    checks.append("detour plugin not enabled: "
+                                  + ", ".join(f"/{n}" for n in sorted(DETOUR_COMMANDS))
+                                  + " are registered by nothing")
+
+            # ...and the patched core must not be providing them either. Checked against the
+            # target's OWN built-in registry, with no assumption that the registry knows the
+            # names: finding them there would mean this is a pre-2.0 (core-resident) install.
+            try:
+                from hermes_cli.commands import COMMAND_REGISTRY
+            except Exception:
+                checks.append("built-in command registry not importable from this target "
+                              "(skipped the core-residue check)")
+            else:
+                builtin = {getattr(c, "name", None) for c in COMMAND_REGISTRY}
+                residue = sorted(name for name in DETOUR_COMMANDS if name in builtin)
+                if residue:
+                    failures.append("the patched core still registers " +
+                                    ", ".join(f"/{n}" for n in residue) +
+                                    " as a built-in command; this bundle expects the plugin to "
+                                    "own them (stale core.patch, or an older install on top)")
+                else:
+                    checks.append("core registers no detour command: the feature comes only "
+                                  "from the plugin")
             # A pre-existing third-party plugin must survive the install untouched.
             for name, entry in loaded.items():
                 if name not in {n for n, _k, _s in wanted} and getattr(entry, "enabled", False):
@@ -1133,8 +1209,8 @@ def cmd_rollback(receipt_path: Path, *, force_scope: Optional[Tuple[Path, Path]]
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="install.py",
-        description="Reapplicable installer for the llm-cr bundle (aliases + detour + prompt "
-                    "injection). Ships no provider, model or endpoint defaults.",
+        description="Reapplicable installer for the llm-cr bundle (aliases + the session-detours "
+                    "plugin + prompt injection). Ships no provider, model or endpoint defaults.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1161,6 +1237,9 @@ def build_parser() -> argparse.ArgumentParser:
                                 "existing instruction file)")
             p.add_argument("--no-aliases", action="store_true",
                            help="install core + payload without enabling the text aliases")
+            p.add_argument("--no-detour-plugin", action="store_true",
+                           help="install the session-detours payload without enabling it "
+                                "(/detour and /detour-end then do not exist on any surface)")
 
     for name in ("check", "dry-run", "apply", "verify"):
         _common(sub.add_parser(name, help=f"{name} the bundle"))

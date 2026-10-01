@@ -520,6 +520,16 @@ class GatewayInboundMixin:
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
 
+        # A plugin-registered command that declared busy_policy="reject" is refused here for the
+        # same reason built-ins are (see _dispatch_busy_slash_command): falling through would
+        # interrupt the running agent and then run the command against a half-torn-down turn.
+        if _evt_cmd:
+            _plugin_cmd = _evt_cmd.replace("_", "-")
+            from hermes_cli.plugins import get_plugin_command_busy_policy
+            if get_plugin_command_busy_policy(_plugin_cmd) == "reject":
+                _denied = self._check_slash_access(source, _plugin_cmd)
+                return True, _denied if _denied is not None else self._busy_reject_text(_plugin_cmd)
+
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
@@ -949,6 +959,14 @@ class GatewayInboundMixin:
         except Exception as e:
             return f"Quick command error: {e}"
 
+    def _plugin_command_session_key(self, source: SessionSource) -> Optional[str]:
+        """The routed session key for a plugin command's host context (None if unresolvable)."""
+        try:
+            return self._session_key_for_source(self._normalize_source_for_session_key(source))
+        except Exception:
+            logger.debug("plugin command: session key resolution failed", exc_info=True)
+            return None
+
     async def _hm_dispatch_quick_and_plugin_commands(
         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
     ) -> Tuple[bool, Optional[str], Optional[str]]:
@@ -985,9 +1003,26 @@ class GatewayInboundMixin:
         # underscored autocomplete form matches plugin commands registered with hyphens.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
+                from hermes_cli.plugins import (
+                    bind_plugin_command_context, get_plugin_command_handler,
+                )
+                _plugin_name = command.replace("_", "-")
+                plugin_handler = get_plugin_command_handler(_plugin_name)
                 if plugin_handler:
+                    # Gate on the NORMALIZED name. The cold-path gate in _hm_resolve_command runs
+                    # against the typed form, so the underscored autocomplete spelling of a
+                    # hyphenated plugin command (/detour_end) would otherwise reach this dispatch
+                    # sink unchecked — the same hole the quick-command gate above closes.
+                    _denied = self._check_slash_access(source, _plugin_name)
+                    if _denied is not None:
+                        return True, _denied, command
+                    # Handlers that declare a ``context`` parameter get this gateway, the event and
+                    # the routed session as their host context; the rest are called unchanged.
+                    plugin_handler = bind_plugin_command_context(plugin_handler, {
+                        "surface": "gateway", "command": _plugin_name, "host": self,
+                        "session_key": self._plugin_command_session_key(source),
+                        "event": event, "source": source,
+                    })
                     result = plugin_handler(event.get_command_args().strip())
                     if asyncio.iscoroutine(result):
                         result = await result

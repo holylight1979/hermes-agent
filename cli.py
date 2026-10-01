@@ -41,7 +41,6 @@ from hermes_cli.cli_terminal_mixin import CLITerminalMixin
 from hermes_cli.cli_modal_mixin import CLIModalMixin
 from hermes_cli.cli_stream_mixin import CLIStreamMixin
 from hermes_cli.cli_session_mixin import CLISessionMixin
-from hermes_cli.cli_detour_mixin import CLIDetourMixin
 from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
 from hermes_cli.cli_voice_mixin import CLIVoiceMixin
 from hermes_cli.cli_status_bar_mixin import CLIStatusBarMixin
@@ -2528,7 +2527,7 @@ from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
 _PASTE_REF_RE = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
 
 
-class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLIDetourMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
+class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMixin, CLIStatusBarMixin, CLIVoiceMixin, CLIModelSwitchMixin, CLISessionMixin, CLIStreamMixin, CLIModalMixin, CLITerminalMixin, CLIInfoMixin, CLILoopsMixin, CLIChatTurnMixin):
     """Interactive REPL for the Hermes Agent."""
 
     # Seeded -q first message (see _should_seed_interactive); run() re-creates
@@ -3303,11 +3302,20 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         return True
 
     def _run_plugin_slash_command(self, base_cmd: str, user_args: str) -> None:
-        from hermes_cli.plugins import get_plugin_command_handler, resolve_plugin_command_result
+        from hermes_cli.plugins import (
+            bind_plugin_command_context, get_plugin_command_handler, resolve_plugin_command_result,
+        )
 
-        plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
+        name = base_cmd.lstrip("/")
+        plugin_handler = get_plugin_command_handler(name)
         if not plugin_handler:
             return
+        # Handlers that declare a ``context`` parameter get this CLI as their host; the rest are
+        # called unchanged (see plugins.bind_plugin_command_context).
+        plugin_handler = bind_plugin_command_context(plugin_handler, {
+            "surface": "cli", "command": name, "host": self,
+            "session_key": getattr(self, "session_id", None),
+        })
         try:
             result = resolve_plugin_command_result(plugin_handler(user_args))
             if result:

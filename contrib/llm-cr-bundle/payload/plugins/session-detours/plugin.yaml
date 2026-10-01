@@ -1,0 +1,4 @@
+name: session-detours
+version: "1.0.0"
+description: "/detour and /detour-end — leave a conversation for a fresh side session on a chosen route, then come back to the original transcript"
+author: hermes-contrib

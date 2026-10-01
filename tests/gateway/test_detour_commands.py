@@ -18,7 +18,8 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, SessionStore
-from hermes_cli.session_detour import (
+from tests.fakes.session_detours_plugin import detour_gateway
+from tests.fakes.session_detours_plugin import (
     STATUS_ACTIVE,
     STATUS_ENTERING,
     STATUS_RETURNED,
@@ -105,7 +106,7 @@ def runner(tmp_path, monkeypatch):
 
 def _scope(runner, source=None) -> DetourScope:
     source = source or _source()
-    return runner._detour_scope(source, runner._session_key_for_source(source))
+    return detour_gateway(runner)._detour_scope(source, runner._session_key_for_source(source))
 
 
 def _routed(runner, source=None) -> str:
@@ -140,7 +141,7 @@ async def _seed_parent(runner, source=None, texts=("hello parent",)):
 async def test_detour_rotates_to_a_fresh_empty_session_and_records_the_way_back(runner):
     parent = await _seed_parent(runner)
 
-    reply = await runner._handle_detour_command(_event("/detour some-model --provider some-provider"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model --provider some-provider"))
 
     child = _routed(runner)
     assert child and child != parent
@@ -160,11 +161,11 @@ async def test_detour_rotates_to_a_fresh_empty_session_and_records_the_way_back(
 @pytest.mark.asyncio
 async def test_detour_end_returns_to_the_parent_with_its_own_history(runner):
     parent = await _seed_parent(runner, texts=("hello parent", "second parent turn"))
-    await runner._handle_detour_command(_event("/detour some-model --provider some-provider"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour some-model --provider some-provider"))
     child = _routed(runner)
     runner.session_store.append_to_transcript(child, {"role": "user", "content": "child only"})
 
-    reply = await runner._handle_detour_end_command(_event("/detour-end back-model --provider back-provider"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end back-model --provider back-provider"))
 
     assert _routed(runner) == parent
     assert parent in reply
@@ -183,10 +184,10 @@ async def test_detour_end_returns_to_the_parent_with_its_own_history(runner):
 @pytest.mark.asyncio
 async def test_the_child_never_sees_the_parents_history_in_either_direction(runner):
     parent = await _seed_parent(runner, texts=("parent secret",))
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
     runner.session_store.append_to_transcript(child, {"role": "user", "content": "child secret"})
-    await runner._handle_detour_end_command(_event("/detour-end"))
+    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
     parent_texts = [m["content"] for m in runner.session_store.load_transcript(parent)]
     child_texts = [m["content"] for m in runner.session_store.load_transcript(child)]
@@ -196,7 +197,7 @@ async def test_the_child_never_sees_the_parents_history_in_either_direction(runn
 @pytest.mark.asyncio
 async def test_a_bare_detour_switches_no_model_at_all(runner):
     await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     assert runner.applied_routes == []
     assert read_record(_scope(runner)).status == STATUS_ACTIVE
 
@@ -207,11 +208,11 @@ async def test_the_next_turn_routes_to_the_child_then_back_to_the_parent(runner)
     """What the next inbound message resolves to — the native route, not just a stored id."""
     source = _source()
     parent = await _seed_parent(runner, source)
-    await runner._handle_detour_command(_event("/detour", source))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour", source))
     child = _routed(runner, source)
     assert (await runner.async_session_store.get_or_create_session(source)).session_id == child
 
-    await runner._handle_detour_end_command(_event("/detour-end", source))
+    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end", source))
     assert (await runner.async_session_store.get_or_create_session(source)).session_id == parent
 
 
@@ -224,13 +225,13 @@ async def test_both_legs_evict_the_cached_agent_and_clear_conversation_scope(run
 
     runner._agent_cache[key] = ("stale-agent", "sig")
     runner._session_model_overrides[key] = {"model": "stale", "provider": "stale"}
-    await runner._handle_detour_command(_event("/detour", source))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour", source))
     assert key not in runner._agent_cache
     assert not runner._session_model_overrides.get(key)
 
     runner._agent_cache[key] = ("stale-child-agent", "sig")
     runner._session_model_overrides[key] = {"model": "child", "provider": "child"}
-    await runner._handle_detour_end_command(_event("/detour-end", source))
+    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end", source))
     assert key not in runner._agent_cache
     # The child's override is gone (the resume cleared conversation scope) and the PARENT's own
     # route — the one the record saved at enter — is deliberately back: returning to a session
@@ -242,10 +243,10 @@ async def test_both_legs_evict_the_cached_agent_and_clear_conversation_scope(run
 @pytest.mark.asyncio
 async def test_a_second_detour_neither_nests_nor_overwrites_the_record(runner):
     parent = await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child, before = _routed(runner), record_path(_scope(runner)).read_bytes()
 
-    reply = await runner._handle_detour_command(_event("/detour other-model"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour other-model"))
 
     assert "already open" in reply
     assert _routed(runner) == child  # no second rotation
@@ -257,10 +258,10 @@ async def test_a_second_detour_neither_nests_nor_overwrites_the_record(runner):
 @pytest.mark.asyncio
 async def test_a_second_detour_end_is_a_quiet_no_op(runner):
     parent = await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
-    await runner._handle_detour_end_command(_event("/detour-end"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
-    reply = await runner._handle_detour_end_command(_event("/detour-end back-model"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end back-model"))
 
     assert "Nothing to end" in reply
     assert _routed(runner) == parent  # still on the parent; nothing created or switched
@@ -272,7 +273,7 @@ async def test_detour_end_without_any_detour_creates_nothing(runner):
     parent = await _seed_parent(runner)
     sessions_before = _session_ids(runner)
 
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
     assert "Nothing to end" in reply
     assert _routed(runner) == parent
@@ -284,12 +285,12 @@ async def test_detour_end_without_any_detour_creates_nothing(runner):
 @pytest.mark.asyncio
 async def test_a_corrupt_record_refuses_the_return_and_is_preserved(runner):
     parent = await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
     path = record_path(_scope(runner))
     path.write_bytes(b"{ truncated")
 
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
     assert reply.startswith("❌")
     assert _routed(runner) == child  # fail closed: no switch, no new session
@@ -300,13 +301,13 @@ async def test_a_corrupt_record_refuses_the_return_and_is_preserved(runner):
 @pytest.mark.asyncio
 async def test_a_missing_parent_session_refuses_the_return_and_keeps_the_record(runner):
     await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
     record = read_record(_scope(runner))
     runner._session_db._db.delete_session(record.parent_session_id,
                                      sessions_dir=runner.home / "sessions")
 
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
     assert "no longer exists" in reply
     assert _routed(runner) == child
@@ -323,13 +324,13 @@ async def test_an_async_only_session_store_fails_the_gates_closed(runner):
             return {"id": "whatever"}
 
     await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
     runner._session_db = _AsyncOnly()
 
-    assert runner._detour_sync_session_db() is None
-    assert runner._detour_session_exists(child) is False
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    assert detour_gateway(runner)._detour_sync_session_db() is None
+    assert detour_gateway(runner)._detour_session_exists(child) is False
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
     assert "no longer exists" in reply
     assert _routed(runner) == child
@@ -344,7 +345,7 @@ async def test_a_failed_reset_rolls_the_record_back(runner, monkeypatch):
         raise RuntimeError("reset exploded")
 
     monkeypatch.setattr(runner, "_handle_reset_command", _boom)
-    reply = await runner._handle_detour_command(_event("/detour some-model"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 
     assert "Nothing changed" in reply
     assert _routed(runner) == parent
@@ -355,14 +356,14 @@ async def test_a_failed_reset_rolls_the_record_back(runner, monkeypatch):
 @pytest.mark.asyncio
 async def test_a_failed_resume_keeps_the_detour_open(runner, monkeypatch):
     await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
 
     async def _refuse(_event):
         return "not allowed"
 
     monkeypatch.setattr(runner, "_handle_resume_command", _refuse)
-    reply = await runner._handle_detour_end_command(_event("/detour-end back-model"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end back-model"))
 
     assert "stays open" in reply
     assert _routed(runner) == child
@@ -379,7 +380,7 @@ async def test_a_route_that_cannot_be_applied_rolls_the_whole_enter_leg_back(run
         raise RuntimeError("provider unreachable")
 
     runner._handle_model_command = _boom
-    reply = await runner._handle_detour_command(_event("/detour some-model"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 
     assert "Detour not started" in reply and "model switch failed" in reply
     assert _routed(runner) == parent  # back on the original conversation
@@ -392,7 +393,7 @@ async def test_a_switch_that_reports_success_but_changes_nothing_is_treated_as_f
     parent = await _seed_parent(runner)
     runner.model_switch_is_broken = True
 
-    reply = await runner._handle_detour_command(_event("/detour some-model"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 
     assert "Detour not started" in reply and "did not take effect" in reply
     assert _routed(runner) == parent
@@ -402,7 +403,7 @@ async def test_a_switch_that_reports_success_but_changes_nothing_is_treated_as_f
 def _break_the_lane_lock(monkeypatch):
     """No advisory lock obtainable. Returns the switch so a test can let it work again without
     ``monkeypatch.undo`` (which would also undo the runner fixture's patches)."""
-    import hermes_cli.session_detour as detour_mod
+    from tests.fakes.session_detours_plugin import records as detour_mod
 
     broken = {"on": True}
     real_flock = detour_mod._flock
@@ -425,7 +426,7 @@ async def test_a_lane_that_cannot_be_locked_refuses_the_enter_leg_and_changes_no
     rows_before = _session_ids(runner)
     _break_the_lane_lock(monkeypatch)
 
-    reply = await runner._handle_detour_command(_event("/detour some-model"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event("/detour some-model"))
 
     assert "Detour not started" in reply and "could not be locked" in reply
     assert _routed(runner) == parent
@@ -438,11 +439,11 @@ async def test_a_lane_that_cannot_be_locked_refuses_the_enter_leg_and_changes_no
 async def test_a_lane_that_cannot_be_locked_refuses_the_return_leg_and_keeps_the_detour(
         runner, monkeypatch):
     await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
     _break_the_lane_lock(monkeypatch)
 
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
 
     assert "Could not end the detour" in reply and "could not be locked" in reply
     assert _routed(runner) == child  # no resume, no switch
@@ -454,16 +455,16 @@ async def test_a_detour_refused_by_the_lock_succeeds_on_the_next_try(runner, mon
     """A refusal must not wedge the lane — the retry is an ordinary round trip."""
     parent = await _seed_parent(runner)
     broken = _break_the_lane_lock(monkeypatch)
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     assert _routed(runner) == parent
 
     broken["on"] = False
-    await runner._handle_detour_command(_event("/detour"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     child = _routed(runner)
     assert child and child != parent
     assert read_record(_scope(runner)).status == STATUS_ACTIVE
 
-    await runner._handle_detour_end_command(_event("/detour-end"))
+    await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
     assert _routed(runner) == parent
     assert read_record(_scope(runner)).status == STATUS_RETURNED
 
@@ -472,7 +473,7 @@ async def test_a_detour_refused_by_the_lock_succeeds_on_the_next_try(runner, mon
 @pytest.mark.parametrize("args", ["some-model --global", "some-model --once"])
 async def test_a_route_that_would_outlive_the_detour_is_refused_before_anything_happens(runner, args):
     parent = await _seed_parent(runner)
-    reply = await runner._handle_detour_command(_event(f"/detour {args}"))
+    reply = await detour_gateway(runner)._handle_detour_command(_event(f"/detour {args}"))
     assert reply.startswith("❌")
     assert _routed(runner) == parent
     assert not record_path(_scope(runner)).exists()
@@ -485,10 +486,10 @@ async def test_another_users_detour_is_invisible_and_unusable(runner):
     my_parent = await _seed_parent(runner, mine)
     their_parent = await _seed_parent(runner, theirs, texts=("their parent",))
 
-    await runner._handle_detour_command(_event("/detour", mine))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour", mine))
     # The other lane has no record at all, so its /detour-end is a no-op on its own session.
     assert read_record(_scope(runner, theirs)) is None
-    reply = await runner._handle_detour_end_command(_event("/detour-end", theirs))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end", theirs))
     assert "Nothing to end" in reply
     assert _routed(runner, theirs) == their_parent
     # ...and my detour is still open, pointing at my parent.
@@ -498,7 +499,7 @@ async def test_another_users_detour_is_invisible_and_unusable(runner):
 @pytest.mark.asyncio
 async def test_a_cli_record_cannot_be_used_by_the_gateway_lane(runner):
     """Cross-surface isolation: same owner, different surface, different record."""
-    from hermes_cli.session_detour import begin_detour
+    from tests.fakes.session_detours_plugin import begin_detour
 
     await _seed_parent(runner)
     gateway_scope = _scope(runner)
@@ -507,7 +508,7 @@ async def test_a_cli_record_cannot_be_used_by_the_gateway_lane(runner):
 
     assert record_path(cli_scope) != record_path(gateway_scope)
     assert read_record(gateway_scope) is None
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
     assert "Nothing to end" in reply
 
 
@@ -520,7 +521,7 @@ async def test_a_detour_survives_a_gateway_restart(runner, tmp_path):
 
     source = _source()
     parent = await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour", source))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour", source))
     child = _routed(runner)
 
     fresh = object.__new__(GatewayRunner)
@@ -535,7 +536,7 @@ async def test_a_detour_survives_a_gateway_restart(runner, tmp_path):
     fresh._handle_model_command = runner._handle_model_command
 
     assert _routed(fresh, source) == child  # the lane still routes to the detour session
-    reply = await fresh._handle_detour_end_command(_event("/detour-end", source))
+    reply = await detour_gateway(fresh)._handle_detour_end_command(_event("/detour-end", source))
     assert _routed(fresh, source) == parent, reply
     assert read_record(_scope(fresh)).status == STATUS_RETURNED
 
@@ -548,7 +549,7 @@ async def test_the_written_record_is_readable_json_without_secrets(runner):
         "base_url": "http://host/v1",
     }
     await _seed_parent(runner)
-    await runner._handle_detour_command(_event("/detour child-model --provider child-provider"))
+    await detour_gateway(runner)._handle_detour_command(_event("/detour child-model --provider child-provider"))
 
     text = record_path(_scope(runner)).read_text(encoding="utf-8")
     assert "sk-leak" not in text
@@ -563,19 +564,19 @@ async def test_the_written_record_is_readable_json_without_secrets(runner):
 @pytest.mark.asyncio
 async def test_an_interrupted_enter_leaves_a_returnable_entering_record(runner):
     """Crash between the record write and the rotation: the parent id is already durable."""
-    from hermes_cli.session_detour import begin_detour
+    from tests.fakes.session_detours_plugin import begin_detour
 
     parent = await _seed_parent(runner)
     begin_detour(_scope(runner), parent_session_id=parent)
     assert read_record(_scope(runner)).status == STATUS_ENTERING
 
     # A later /detour refuses (the record is open) rather than nesting.
-    assert "already open" in await runner._handle_detour_command(_event("/detour"))
+    assert "already open" in await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     # The return leg clears it instead of wedging the lane, and changes no session.
-    reply = await runner._handle_detour_end_command(_event("/detour-end"))
+    reply = await detour_gateway(runner)._handle_detour_end_command(_event("/detour-end"))
     assert "never started" in reply
     assert _routed(runner) == parent
     assert read_record(_scope(runner)).status == STATUS_RETURNED
     # ...and a fresh detour is possible again.
-    assert "already open" not in await runner._handle_detour_command(_event("/detour"))
+    assert "already open" not in await detour_gateway(runner)._handle_detour_command(_event("/detour"))
     assert _routed(runner) != parent

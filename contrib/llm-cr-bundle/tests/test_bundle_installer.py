@@ -138,7 +138,7 @@ def test_an_unresolvable_base_url_is_refused_rather_than_invented():
     assert "--cr-base-url" in str(excinfo.value)
 
 
-def test_aliases_name_the_native_detour_commands_for_the_given_route():
+def test_aliases_name_the_detour_commands_the_plugin_registers_for_the_given_route():
     assert install._alias_commands(_opts()) == {
         "llm-cr": "/detour test/cr-model:Q4_K_M --provider cr-local",
         "llm-cr-end": "/detour-end exit-model-900k --provider exit-direct",
@@ -164,7 +164,8 @@ def test_the_merge_preserves_unrelated_keys_existing_plugins_and_secrets():
     assert new["providers"]["cr-local"]["api_key"] == "sk-must-survive"
     assert new["plugins"]["enabled"][0] == "already-on"  # appended to, never replaced
     assert new["plugins"]["entries"]["already-on"] == {"settings": {"keep": True}}
-    assert set(new["plugins"]["enabled"]) == {"already-on", "text-command-aliases", "llm-cr-prompt"}
+    assert set(new["plugins"]["enabled"]) == {
+        "already-on", "text-command-aliases", "session-detours", "llm-cr-prompt"}
     assert changes  # a fresh target has work to do
     # The input mapping is untouched, so a refusal mid-plan cannot have mutated the live config.
     assert config["plugins"]["enabled"] == ["already-on"]
@@ -203,6 +204,20 @@ def test_no_aliases_leaves_the_alias_section_absent():
     new, _ = install.plan_config_merge({}, _opts(no_aliases=True, enable_prompt_plugin=True), "u")
     assert install.ALIAS_SECTION not in new
     assert "text-command-aliases" not in new["plugins"]["enabled"]
+
+
+def test_the_detour_plugin_is_enabled_by_default_and_can_be_declined():
+    """/detour is a plugin in 2.x, so enabling it is a config decision the operator can refuse —
+    and refusing it must not drag the other two plugins out with it."""
+    on, changes = install.plan_config_merge({}, _opts(), "")
+    assert install.DETOUR_PLUGIN in on["plugins"]["enabled"]
+    assert any(install.DETOUR_PLUGIN in c for c in changes)
+    off, _ = install.plan_config_merge({}, _opts(no_detour_plugin=True), "")
+    assert install.DETOUR_PLUGIN not in off["plugins"]["enabled"]
+    assert "text-command-aliases" in off["plugins"]["enabled"]  # unaffected
+    # The plugin carries no settings subtree of its own: there is nothing to configure, so a
+    # declined detour leaves no entry behind either.
+    assert install.DETOUR_PLUGIN not in off["plugins"].get("entries", {})
 
 
 def test_the_change_list_never_echoes_a_settings_value_that_could_be_sensitive():
@@ -560,6 +575,21 @@ LLM_EXECUTION_MIDDLEWARE = "llm_execution"
 class MiddlewareAbort(Exception):
     """The abort type the shipped injector imports and raises."""
 ''',
+    # The post-patch core registry: in 2.x the detour commands are NOT here, they are the plugin's.
+    # `verify` reads this to catch a pre-2.0 (core-resident) install underneath, so the fixture has
+    # to own it rather than leaving the probe to import this repo's real registry.
+    "hermes_cli/commands.py": b'''"""Stand-in built-in command registry."""
+
+
+class CommandDef:
+    def __init__(self, name, busy_policy=None):
+        self.name = name
+        self.busy_policy = busy_policy
+
+
+COMMAND_REGISTRY = [CommandDef("new"), CommandDef("resume"),
+                    CommandDef("model", busy_policy="reject")]
+''',
     "hermes_cli/text_command_aliases.py": b'''"""Stand-in matcher with the exact-match semantics `verify` asserts on."""
 
 
@@ -623,12 +653,28 @@ class _Ctx:
     def register_middleware(self, seam, handler):
         self._manager._middleware.setdefault(seam, []).append((self._name, handler))
 
+    def register_command(self, name, handler, description="", args_hint="",
+                         argument_mode=None, busy_policy=None):
+        """Same shape the real loader records: a normalized name and an entry dict whose
+        ``busy_policy`` is kept only when it is one the busy path actually understands."""
+        clean = name.lower().strip().lstrip("/").replace(" ", "-")
+        if not clean:
+            return
+        self._manager._plugin_commands[clean] = {
+            "handler": handler, "description": description or "Plugin command",
+            "plugin": self._name, "args_hint": args_hint.strip(),
+            "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
+            else ("text" if args_hint.strip() else None),
+            "busy_policy": busy_policy if busy_policy in {"reject"} else None,
+        }
+
 
 class PluginManager:
     def __init__(self):
         self._plugins = {}
         self._hooks = {}
         self._middleware = {}
+        self._plugin_commands = {}
 
     def discover_and_load(self, force=False):
         home = Path(os.environ["HERMES_HOME"])
@@ -858,6 +904,10 @@ def test_the_nested_standard_layout_installs_verifies_and_rolls_back(nested_inst
     assert "matcher resolves 'llm-cr'" in out
     assert "near-miss correctly not an alias" in out
     assert "plugin loaded + enabled by production discovery" in out
+    # The detour feature IS these two plugin-command registrations, busy_policy included.
+    assert "command /detour (busy_policy='reject')" in out
+    assert "command /detour-end (busy_policy='reject')" in out
+    assert "core registers no detour command" in out
     # verify is read-only on process state as well as on disk.
     assert "HERMES_HOME" not in os.environ
     assert str(fx.repo) not in sys.path

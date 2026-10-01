@@ -765,7 +765,7 @@ class GatewayBusySessionMixin:
         "approvals", "model", "codex-runtime", "personality", "suggestions", "save", "retry",
         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
-        "loop", "refine", "review", "voice", "detour", "detour-end",
+        "loop", "refine", "review", "voice",
     )
 
     def _command_handler_table(self, names) -> Dict[str, Any]:
@@ -833,6 +833,11 @@ class GatewayBusySessionMixin:
                 "falling back to busy-reject", policy, name,
             )
 
+        return self._busy_reject_text(name)
+
+    @staticmethod
+    def _busy_reject_text(name: str) -> str:
+        """The mid-run refusal for ``/name`` (shared with the plugin-command busy path)."""
         return (
             f"⏳ Agent is running — `/{name}` can't run "
             f"mid-turn. Wait for the current response or `/stop` first."
