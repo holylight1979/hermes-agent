@@ -1,0 +1,4 @@
+# Preserve manifest-verified bytes across Windows/Linux checkouts.
+* -text
+# Unified diff context markers are required, not source whitespace errors.
+core.patch -whitespace

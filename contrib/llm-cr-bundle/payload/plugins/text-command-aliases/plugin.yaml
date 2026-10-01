@@ -1,0 +1,6 @@
+name: text-command-aliases
+version: "1.0.0"
+description: Rewrite exact bare-text messages into their configured slash command before dispatch
+author: hermes-contrib
+hooks:
+  - pre_gateway_dispatch

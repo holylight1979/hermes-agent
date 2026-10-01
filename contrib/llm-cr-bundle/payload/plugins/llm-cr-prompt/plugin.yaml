@@ -1,0 +1,4 @@
+name: llm-cr-prompt
+version: "1.0.0"
+description: Inject the local crack-talk instruction file into the system prompt of requests that are actually routed to the configured local provider+model
+author: hermes-contrib

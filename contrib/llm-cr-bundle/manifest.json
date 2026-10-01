@@ -1,0 +1,197 @@
+{
+  "name": "llm-cr-bundle",
+  "version": "1.0.0",
+  "manifest_version": 1,
+  "base_commit": "45a6101f36576367359c171cd5820ee76a3d047b",
+  "base_commit_note": "core.patch is generated against this upstream commit and is checked with `git apply --check` (and `--reverse --check` for the already-applied case) before anything is written.",
+  "ships_no_defaults": [
+    "provider",
+    "model",
+    "return_provider",
+    "return_model",
+    "base_url",
+    "instruction file content"
+  ],
+  "core_patch": {
+    "file": "core.patch",
+    "sha256": "17ec6c39fd8bb6fc90a7d9f34c3a605832022901d02bdf47ef35da456eabee19",
+    "paths": [
+      "cli.py",
+      "gateway/run_busy.py",
+      "gateway/slash_commands.py",
+      "gateway/slash_commands_detour.py",
+      "hermes_cli/cli_detour_mixin.py",
+      "hermes_cli/commands.py",
+      "hermes_cli/config.py",
+      "hermes_cli/middleware.py",
+      "hermes_cli/session_detour.py",
+      "hermes_cli/text_command_aliases.py",
+      "tests/cli/test_slash_dispatch_table.py",
+      "tests/gateway/test_detour_commands.py",
+      "tests/gateway/test_text_command_alias_deployed_plugin.py",
+      "tests/gateway/test_text_command_alias_dispatch.py",
+      "tests/gateway/test_text_command_alias_model_switch.py",
+      "tests/hermes_cli/test_cli_detour.py",
+      "tests/hermes_cli/test_session_detour_records.py",
+      "tests/hermes_cli/test_text_command_aliases.py"
+    ]
+  },
+  "payload": {
+    "plugins/llm-cr-prompt/__init__.py": "170af12e97c5b96d048ee69d79a284fb571c05aec4e3c65adde35d5c905cd4b4",
+    "plugins/llm-cr-prompt/injector.py": "a0639dd48f6c458b3abe805883c78a3676cf71c15a4f7f0e5cadca1afc864650",
+    "plugins/llm-cr-prompt/plugin.yaml": "cfd86b530a8483b70a2cd52a4b3bfc7651078f59773579145950c2897bb8b3b6",
+    "plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py": "0db4c91b054e2d649bdd0d5d2486699debaed1c98529fd6a228ad40315623fae",
+    "plugins/text-command-aliases/__init__.py": "e35eb5c8fdc560f47b7ab74f853d3b476d8c82307cc7dba8176ade800115611a",
+    "plugins/text-command-aliases/plugin.yaml": "3f974b1fd6890ca4c1a908beb8b39dd5730d455c16cf174b4d7f0c99e95fbff3"
+  },
+  "payload_install_root": "<hermes-home>",
+  "required_apis": [
+    {
+      "file": "gateway/run_inbound.py",
+      "contains": [
+        "def _hm_pre_gateway_dispatch_hook",
+        "_action == \"rewrite\"",
+        "allow_gateway_control"
+      ],
+      "why": "the text-command-aliases plugin rewrites event.text through this existing hook seam; without the rewrite directive the alias would silently never fire"
+    },
+    {
+      "file": "hermes_cli/plugins.py",
+      "contains": [
+        "\"pre_gateway_dispatch\"",
+        "def register_middleware",
+        "def register_hook",
+        "def get_config"
+      ],
+      "why": "both plugins register through these loader APIs and read their own settings subtree"
+    },
+    {
+      "file": "hermes_cli/middleware.py",
+      "contains": [
+        "LLM_EXECUTION_MIDDLEWARE = \"llm_execution\"",
+        "def _run_execution_chain",
+        "def run_llm_execution_middleware"
+      ],
+      "why": "llm-cr-prompt is llm_execution middleware; the patch adds MiddlewareAbort to this chain, so the chain has to be the one the patch expects"
+    },
+    {
+      "file": "agent/turn_api_call.py",
+      "contains": [
+        "run_llm_execution_middleware(",
+        "provider=agent.provider",
+        "base_url=agent.base_url",
+        "api_mode=agent.api_mode"
+      ],
+      "why": "the injector's route gate reads exactly these context kwargs; a renamed or dropped kwarg would make the gate never match and the instruction never load"
+    },
+    {
+      "file": "hermes_cli/config.py",
+      "contains": [
+        "def read_raw_config_readonly",
+        "_OPEN_DICT_TOP_LEVEL_KEYS"
+      ],
+      "why": "the gateway plugin reads raw config through the first; the patch adds the alias section to the second so config validation accepts it"
+    },
+    {
+      "file": "utils.py",
+      "contains": [
+        "def atomic_json_write"
+      ],
+      "why": "session_detour writes its durable return records through this"
+    },
+    {
+      "file": "hermes_cli/profiles.py",
+      "contains": [
+        "def get_active_profile_name"
+      ],
+      "why": "session_detour labels a record with its profile"
+    },
+    {
+      "file": "hermes_constants.py",
+      "contains": [
+        "def get_hermes_home"
+      ],
+      "why": "both the record directory and the injector's default instruction path derive from it"
+    },
+    {
+      "file": "hermes_cli/model_switch.py",
+      "contains": [
+        "def parse_model_switch_args"
+      ],
+      "why": "the detour route parser reuses the one /model parser, including its flag conflicts"
+    },
+    {
+      "file": "gateway/slash_commands_session.py",
+      "contains": [
+        "def _handle_reset_command",
+        "def _handle_resume_command"
+      ],
+      "why": "gateway /detour and /detour-end are composed from these native handlers (the resume handler's IDOR guard included) rather than reimplementing session rotation"
+    },
+    {
+      "file": "gateway/slash_commands_model.py",
+      "contains": [
+        "def _handle_model_command"
+      ],
+      "why": "the gateway detour applies its route through the native /model handler"
+    },
+    {
+      "file": "gateway/run.py",
+      "contains": [
+        "def _session_key_for_source"
+      ],
+      "why": "the gateway detour lane key is the native session key for the source"
+    },
+    {
+      "file": "hermes_cli/cli_session_mixin.py",
+      "contains": [
+        "def new_session"
+      ],
+      "why": "CLI /detour runs the native fresh-session path, including its memory-boundary flush"
+    },
+    {
+      "file": "hermes_cli/cli_commands_mixin.py",
+      "contains": [
+        "def _handle_resume_command"
+      ],
+      "why": "CLI /detour-end returns through the native resume handler"
+    },
+    {
+      "file": "hermes_cli/cli_model_switch_mixin.py",
+      "contains": [
+        "def _handle_model_switch"
+      ],
+      "why": "the CLI detour applies its route through the native model switch"
+    },
+    {
+      "file": "hermes_cli/commands.py",
+      "contains": [
+        "COMMAND_REGISTRY",
+        "CommandDef("
+      ],
+      "why": "the patch registers /detour and /detour-end in this central registry; the CLI reaches them via the _handle_<name>_command naming-convention fallback"
+    }
+  ],
+  "tests": {
+    "in_repo": [
+      "tests/hermes_cli/test_text_command_aliases.py",
+      "tests/hermes_cli/test_session_detour_records.py",
+      "tests/hermes_cli/test_cli_detour.py",
+      "tests/gateway/test_text_command_alias_dispatch.py",
+      "tests/gateway/test_text_command_alias_model_switch.py",
+      "tests/gateway/test_text_command_alias_deployed_plugin.py",
+      "tests/gateway/test_detour_commands.py",
+      "tests/cli/test_slash_dispatch_table.py"
+    ],
+    "in_home": [
+      "plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py"
+    ]
+  },
+  "bundle_files": {
+    "README.md": "0cf80eb57aa0c451ee984ca1e59d8542dfa6e32897a39cd0814c2a07fd388674",
+    "install.py": "c828cd61baf636a3153df69b5984a6e6e8c8cc99b0a33bc9b42f450b3e7d56ab",
+    "build.py": "e8f1539c3ea2134cbb434e62221ebc1d0465a2ebd0f0cad8ca1f34e0a9b8200d",
+    "core.patch": "17ec6c39fd8bb6fc90a7d9f34c3a605832022901d02bdf47ef35da456eabee19",
+    "docs/SKILL.md": "738fa7e0955b47dd8045191570337871f55c25e77eccf0b2256d2c380801d610"
+  }
+}
