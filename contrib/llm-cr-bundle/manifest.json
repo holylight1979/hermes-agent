@@ -36,10 +36,13 @@
     ]
   },
   "payload": {
-    "plugins/llm-cr-prompt/__init__.py": "170af12e97c5b96d048ee69d79a284fb571c05aec4e3c65adde35d5c905cd4b4",
-    "plugins/llm-cr-prompt/injector.py": "a0639dd48f6c458b3abe805883c78a3676cf71c15a4f7f0e5cadca1afc864650",
+    "plugins/llm-cr-prompt/__init__.py": "c9ba1a0503adadc8585312fa9d76013e7174df04ca381d1df3f6d42f769e4c91",
+    "plugins/llm-cr-prompt/injector.py": "ffd45f413e43105d29fe6a514d513352383e06fba49e3de01c4cfb3c374c16cf",
+    "plugins/llm-cr-prompt/light_web.py": "6f8bb9b5500537939c16eb210d836c1b64c1a8b6d7a97cdd646f4dfb675b534a",
     "plugins/llm-cr-prompt/plugin.yaml": "cfd86b530a8483b70a2cd52a4b3bfc7651078f59773579145950c2897bb8b3b6",
-    "plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py": "0db4c91b054e2d649bdd0d5d2486699debaed1c98529fd6a228ad40315623fae",
+    "plugins/llm-cr-prompt/tests/test_llm_cr_light_web.py": "ae0da48eb8aa5d26fca6110613d401fdebf485d6f9c9648d2e2f4e403aae67e5",
+    "plugins/llm-cr-prompt/tests/test_llm_cr_prompt_injection.py": "dc8871931f16118e273b5826a94463977f7e78dcd24ded52f068a3f70b20eac4",
+    "plugins/llm-cr-prompt/tool_gate.py": "43cec36dedb9c2623cc904afba7e06d18556c097de2fd22ad105d2a55a3497af",
     "plugins/session-detours/__init__.py": "ac8ba0ba42f0505c2777893a40d7f5210f70cffffc0e53a325addad6ebeacfb9",
     "plugins/session-detours/cli_surface.py": "10443fd130f29b7b0515d5105a05b8643870ab5aae31e76dda23bbcfad192b53",
     "plugins/session-detours/detour_records.py": "020482568c833f2055a10d557b59084c6b7a21535c2e4783d67490fdbb39d6e8",
@@ -207,7 +210,7 @@
     ]
   },
   "bundle_files": {
-    "README.md": "af817c5c2087427531e800eaadaa30ab9ef90b44d052d693544b5979797cdc9d",
+    "README.md": "46af41169e12055b54676b7ea21d3d5107b6f864982ef7b95a289b6f1363f914",
     "install.py": "5e8be1c6d4d05a94bed54ddce04b48064ec22f048596bade41886342d6edb46c",
     "build.py": "a094b48e02a02d03d8beec383a581f87003e56f59566a365e4b5b4a25bb8d9fd",
     "core.patch": "1a9502fe118292d2d7e730bd79dbde72059544072c4084e94837d79475f93d12",

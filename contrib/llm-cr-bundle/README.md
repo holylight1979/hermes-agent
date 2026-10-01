@@ -18,7 +18,8 @@
 |---|---|---|
 | 精確文字別名 | 整句（去除首尾空白後）完全等於 `llm-cr` / `llm-cr-end` 時，在任何 LLM 看到訊息**之前**改寫成對應的 slash command | `text-command-aliases` plugin（Gateway 端）＋ core patch（共用 matcher 與 CLI 入口） |
 | 原生 session 繞道 | `/detour` 開一個全新的子 session（不帶入母 session 的歷史），`/detour-end` 回到母 session 並還原它自己的路由 | **`session-detours` plugin**（回程記錄、CLI leg、Gateway leg 全在 plugin 內） |
-| Prompt 注入 | 只有「這一個請求真的要送往設定的 provider + model + base URL + api_mode」時，才把本機指令檔附加到送出請求**副本**的第一條 system message | `llm-cr-prompt` plugin（`llm_execution` middleware） |
+| Prompt 注入 | 只有「這一個請求真的要送往設定的 provider + model + base URL + api_mode」時，才把本機指令檔放進送出請求**副本**的 system message | `llm-cr-prompt` plugin（`llm_execution` middleware） |
+| 輕量聊天／上網（預設開啟） | 命中路由時，送出的**副本**只由「小段聊天＋上網指引＋本機指令檔＋該對話的 user/assistant 訊息＋web 工具的呼叫與結果」組成；工具 schema 只有 `web_search`、`web_extract`，且非這兩者的工具呼叫在**實際執行接縫**被拒絕 | `llm-cr-prompt` plugin（`llm_execution` + `tool_execution` middleware） |
 
 2.x 的核心決定是**「功能全在 plugin，core 只有通用接縫」**：`/detour` 不再是 core 的內建指令，
 而是 `session-detours` plugin 用 `ctx.register_command()` 註冊的 plugin command。沒有啟用這個
@@ -43,6 +44,16 @@ middleware 可以 fail-closed 中止。
   因此手動用 `/model` 選到同一條路由，會得到同一個 persona —— 這是設計，不是漏洞。
 * 注入是 fail-closed：路由命中但指令檔遺失／空白／無法讀取／非 UTF-8，會在**任何網路呼叫之前**
   中止請求（`MiddlewareAbort`）。放行才是錯的 —— 那等於安靜地送出一個沒有 prompt 的請求。
+* 輕量 CR 請求使用 `reasoning_effort: none`，避免額外思考輸出延後回答與工具呼叫；只作用於命中的 CR 請求副本，其他路由參數不變。
+* 輕量模式（`light_web`，預設 `true`）是**投影而不是過濾**：送出的副本是「照想要的幾個部分重新組起來」，
+  Hermes 的 system prompt、記憶區塊、專案身分、skill 索引與其它工具 schema 從頭到尾沒有被複製進去。
+  原始請求物件與它指向的歷史完全不動，所以重試或工具回合會從原件重新投影一次，prompt 不會疊加。
+* 只送兩個 schema 是「呈現」，不是「防護」。防護在 `tool_execution` middleware：命中輕量路由的 session，
+  只有 `web_search` / `web_extract` 會真的被 dispatch，其它一律回一個普通的 error tool result
+  （乾淨拒絕、不中斷回合），`tool_call` / `execute_code` / `terminal` 這類轉包途徑同樣擋在這裡。
+  離開路由（`llm-cr-end`）後，該 session 的下一個請求就會自動解除限制。
+* 原生的授權、核准流程與網站封鎖清單完全不變 —— 這層只做「允許清單」，不取代任何一道既有關卡。
+  web 工具回傳的內容在原生流程中本來就標記為不可信（`_UNTRUSTED_TOOL_NAMES`），指引裡也再講一次。
 * 這是**對話隔離，不是沙箱**。子 session 的工具、權限、檔案系統可及範圍與任何其他 session 相同。
 
 ---

@@ -43,9 +43,9 @@ CR_MODEL = "test/cr-model:Q4_K_M"
 CR_BASE_URL = "http://127.0.0.1:65535/v1"
 CR_API_MODE = "chat_completions"
 
-GPT_PROVIDER = "exit-direct"
-GPT_MODEL = "exit-model-900k"
-GPT_BASE_URL = "https://exit.example.invalid/api"
+MAIN_PROVIDER = "test-main-provider"
+MAIN_MODEL = "test/main-model"
+MAIN_BASE_URL = "http://127.0.0.1:65534/v1"
 
 
 class Recorder:
@@ -92,6 +92,10 @@ def cr_home(tmp_path, monkeypatch):
                 "enabled": True, "route_provider": CR_PROVIDER, "route_model": CR_MODEL,
                 "route_base_url": CR_BASE_URL, "route_api_mode": CR_API_MODE,
                 "instruction_path": str(instruction),
+                # This module covers the route gate itself, so it pins the append-to-system
+                # projection. The lightweight chat+web projection (the default) has its own module,
+                # tests/test_llm_cr_light_web.py.
+                "light_web": False,
             }}},
         },
     }), encoding="utf-8")
@@ -225,10 +229,10 @@ def test_utf8_bom_file_is_decoded_without_the_bom(cr_home):
 
 
 @pytest.mark.parametrize("override", [
-    {"provider": "other-direct"},
+    {"provider": "test-other-provider"},
     {"model": "gemma4:e4b"},
     {"base_url": "http://127.0.0.1:11434/v1"},
-    {"api_mode": "codex_responses"},
+    {"api_mode": "anthropic_messages"},
 ])
 def test_mismatched_route_passes_request_through_untouched_and_never_reads_the_file(cr_home, override):
     # Deleting the file proves the gate runs BEFORE any read: a read would abort the request.
@@ -241,23 +245,23 @@ def test_mismatched_route_passes_request_through_untouched_and_never_reads_the_f
     assert rec.payloads[0] is request
 
 
-def test_gpt_route_after_exit_is_untouched(cr_home):
+def test_default_route_after_exit_is_untouched(cr_home):
     cr_home["instruction"].unlink()
     request = _request()
 
-    rec, _ = _run(request, provider=GPT_PROVIDER, model=GPT_MODEL,
-                  base_url=GPT_BASE_URL, api_mode="codex_responses")
+    rec, _ = _run(request, provider=MAIN_PROVIDER, model=MAIN_MODEL,
+                  base_url=MAIN_BASE_URL, api_mode="anthropic_messages")
 
     assert rec.calls == 1 and rec.payloads[0] is request
 
 
 def test_sessions_are_independent_same_process(cr_home):
-    cr_request, gpt_request = _request(), _request()
+    cr_request, main_request = _request(), _request()
     rec = Recorder()
 
     _run(cr_request, recorder=rec, session_id="session-cr")
-    _run(gpt_request, recorder=rec, session_id="session-gpt", provider=GPT_PROVIDER,
-         model=GPT_MODEL, base_url=GPT_BASE_URL, api_mode="codex_responses")
+    _run(main_request, recorder=rec, session_id="session-main", provider=MAIN_PROVIDER,
+         model=MAIN_MODEL, base_url=MAIN_BASE_URL, api_mode="anthropic_messages")
     _run(cr_request, recorder=rec, session_id="session-cr")
 
     assert [_system_text(p) for p in rec.payloads] == [
@@ -332,8 +336,8 @@ def test_unrelated_middleware_failure_still_fails_open_to_the_native_call(cr_hom
     request = _request()
     rec = Recorder()
     try:
-        _, result = _run(request, recorder=rec, provider=GPT_PROVIDER, model=GPT_MODEL,
-                         base_url=GPT_BASE_URL, api_mode="codex_responses")
+        _, result = _run(request, recorder=rec, provider=MAIN_PROVIDER, model=MAIN_MODEL,
+                         base_url=MAIN_BASE_URL, api_mode="anthropic_messages")
     finally:
         chain.remove(broken)
 
@@ -412,7 +416,8 @@ def test_default_path_points_at_the_active_home(cr_home):
 def test_payload_model_rewritten_after_route_selection_aborts_without_reading_or_calling(
     cr_home, read_spy
 ):
-    """Context still says crack-talk, but a request middleware re-pointed the payload at GPT.
+    """Context still says crack-talk, but a request middleware re-pointed the payload at the
+    default route.
 
     The instruction must not be read, the provider must not be called, and nothing about either may
     appear in the abort. The sentinel file is left in place on purpose: deletion alone could not
@@ -420,7 +425,7 @@ def test_payload_model_rewritten_after_route_selection_aborts_without_reading_or
     """
     from hermes_cli.middleware import MiddlewareAbort
 
-    request = _request(model=GPT_MODEL)
+    request = _request(model=MAIN_MODEL)
     pristine = deepcopy(request)
     rec = Recorder()
 
@@ -432,7 +437,7 @@ def test_payload_model_rewritten_after_route_selection_aborts_without_reading_or
     assert request == pristine
     message = str(excinfo.value)
     assert "SENTINEL" not in message and SENTINEL.strip() not in message
-    assert str(cr_home["instruction"]) not in message and GPT_MODEL not in message
+    assert str(cr_home["instruction"]) not in message and MAIN_MODEL not in message
     assert "llm-cr-prompt" in message
 
 

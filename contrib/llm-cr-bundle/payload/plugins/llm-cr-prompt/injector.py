@@ -37,6 +37,20 @@ _INSTRUCTION_RELPATH = Path("skills") / "productivity" / "llm-crack-talk" / "llm
 _DEFAULT_API_MODE = "chat_completions"
 
 
+def _siblings():
+    """Return ``(light_web, tool_gate)`` under either import shape.
+
+    The plugin loader gives this directory a package context; a bare ``import injector`` (what the
+    plugin's own tests do, to reach the pure functions) does not. Resolving lazily keeps both.
+    """
+    try:
+        from . import light_web, tool_gate  # type: ignore[no-redef]
+    except ImportError:
+        import light_web  # type: ignore[no-redef]
+        import tool_gate  # type: ignore[no-redef]
+    return light_web, tool_gate
+
+
 @dataclass(frozen=True)
 class RouteSettings:
     """``plugins.entries.llm-cr-prompt.settings`` as the gate needs it."""
@@ -47,6 +61,7 @@ class RouteSettings:
     base_url: str
     api_mode: str
     instruction_path: Optional[Path]
+    light_web: bool
 
     @property
     def configured(self) -> bool:
@@ -87,6 +102,7 @@ def resolve_settings(ctx: Any) -> RouteSettings:
         base_url=_normalize_url(ctx.get_config("route_base_url", "")),
         api_mode=_text(ctx.get_config("route_api_mode", _DEFAULT_API_MODE)).casefold() or _DEFAULT_API_MODE,
         instruction_path=Path(raw_path) if raw_path else None,
+        light_web=ctx.get_config("light_web", True) is not False,
     )
 
 
@@ -181,6 +197,8 @@ def make_middleware(ctx: Any) -> Callable[..., Any]:
 
     def llm_cr_prompt_execution(request=None, next_call=None, **context):
         settings = resolve_settings(ctx)
+        light_web, tool_gate = _siblings()
+        session_id = context.get("session_id")
         if not route_matches(
             settings,
             provider=context.get("provider"),
@@ -188,7 +206,10 @@ def make_middleware(ctx: Any) -> Callable[..., Any]:
             base_url=context.get("base_url"),
             api_mode=context.get("api_mode"),
         ):
-            # Not the crack-talk route: the instruction file is not even opened.
+            # Not the crack-talk route: the instruction file is not even opened. Clearing the stamp
+            # here is what makes ``llm-cr-end`` give the session its normal toolset back — the very
+            # next request of that session is on another route, and it runs through this line.
+            tool_gate.set_session_light(session_id, False)
             return next_call(request)
 
         # The context above describes the route the turn *selected*; the request mapping describes
@@ -202,10 +223,22 @@ def make_middleware(ctx: Any) -> Callable[..., Any]:
                 "llm-cr-prompt: request payload model does not match the configured route"
             )
 
+        # The tool gate is keyed on the session id: without one, the restriction could not be
+        # attached to anything, and the request would run the crack-talk persona with the FULL
+        # toolset. That is a different, less safe action than the one configured, so it fails closed
+        # here — before the instruction file is opened and before ``next_call``.
+        if settings.light_web and not _text(session_id):
+            raise MiddlewareAbort(
+                "llm-cr-prompt: cannot enforce the lightweight toolset (request carries no session id)"
+            )
+
         path = settings.instruction_path or default_instruction_path()
         try:
             text = load_instruction(path)
-            injected = inject_instruction(request, text)
+            if settings.light_web:
+                outbound = light_web.project_request(request, text)
+            else:
+                outbound = inject_instruction(request, text)
         except MiddlewareAbort:
             raise
         except Exception as exc:
@@ -214,7 +247,14 @@ def make_middleware(ctx: Any) -> Callable[..., Any]:
             raise MiddlewareAbort(
                 f"llm-cr-prompt: instruction injection failed ({type(exc).__name__})"
             ) from None
-        logger.info("llm-cr-prompt: injected instruction for session %s", context.get("session_id") or "-")
-        return next_call(injected)
+        # Stamped only once the payload is built: a request that aborted above never ran, so it must
+        # not leave a session gated to two tools.
+        tool_gate.set_session_light(session_id, settings.light_web)
+        logger.info(
+            "llm-cr-prompt: %s instruction for session %s",
+            "projected lightweight" if settings.light_web else "injected",
+            session_id or "-",
+        )
+        return next_call(outbound)
 
     return llm_cr_prompt_execution

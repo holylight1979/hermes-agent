@@ -567,9 +567,20 @@ _STUB_REPO_FILES = {
     ".gitignore": b"__pycache__/\n",
     "src/core_module.py": _CORE_BEFORE,
     "hermes_cli/__init__.py": b"",
+    # The seam vocabulary the payload imports by name. ``tool_execution`` is as load-bearing as
+    # ``llm_execution``: the shipped plugin imports both at register() time, so a stub missing one
+    # fails the whole plugin with an ImportError rather than the targeted failure it looks like.
     "hermes_cli/middleware.py": b'''"""Stand-in for hermes_cli.middleware."""
 
+TOOL_REQUEST_MIDDLEWARE = "tool_request"
+TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
+LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
+
+VALID_MIDDLEWARE = {
+    TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE,
+    LLM_EXECUTION_MIDDLEWARE,
+}
 
 
 class MiddlewareAbort(Exception):
